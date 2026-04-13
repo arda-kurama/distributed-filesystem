@@ -9,6 +9,7 @@ import time
 import select
 import signal
 import hashlib
+from collections import defaultdict
 
 BUFSIZE = 4096
 HEADER_LEN = 4
@@ -24,8 +25,27 @@ class FileData:
 class NameServer():
     def __init__(self, project_name):
         self.project_name = project_name
-        self.files = dict() # path -> FileData()
-        self.directories = set()
+        # to-do: update files and directories data structures to speed up rpc's
+        self.paths = dict() # path -> FileData()
+        self.dir_tree = defaultdict(lambda: {
+            'dirs': set(),
+            'files': set(),
+        })
+        # structure:
+        # dir_tree = {
+        #     '/': {
+        #         'dirs': {'docs', 'tmp'},
+        #         'files': set(),
+        #     },
+        #     '/docs': {
+        #         'dirs': set(),
+        #         'files': {'report.txt', 'notes.txt'},
+        #     },
+        #     '/tmp': {
+        #         'dirs': set(),
+        #         'files': set(),
+        #     },
+        # }
         self.storage_servers = [None]
 
         # initialize files and directories using checkpoint and log files
@@ -77,16 +97,20 @@ class NameServer():
         try:
             with open(self.checkpoint, 'r') as f:
                 ckpt = json.load(f)
-                ckpt_files = ckpt['files']
-                ckpt_dirs = ckpt['directories']
-                for path, meta in ckpt_files.items():
-                    self.files[path] = FileData(
-                        path=meta['path'],
+                ckpt_paths = ckpt['paths']
+                ckpt_dir_tree = ckpt['dir_tree']
+                for path, meta in ckpt_paths.items():
+                    self.paths[path] = FileData(
+                        id=meta['id'],
                         size=meta['size'],
-                        checksum=meta['checksum']
+                        checksum=meta['checksum'],
+                        server_num=meta['storage_server']
                     )
-                for path in ckpt_dirs:
-                    self.directories.add(path)
+                for dir, entry in ckpt_dir_tree.items():
+                    self.dir_tree[dir] = {
+                        'dirs': set(entry.get('dirs', [])),
+                        'files': set(entry.get('files', []))
+                    }
         except json.JSONDecodeError:
             # empty checkpoint file
             pass
@@ -102,38 +126,49 @@ class NameServer():
                     operation = json.loads(line)
                     self.log_entries += 1
 
-                    if operation['method'] == 'create':
-                        self.files[operation['path']] = FileData(
-                            path=operation['path'],
-                            size=operation['size'],
-                            checksum=operation['checksum']
-                        )
-                    if operation['method'] == 'remove':
-                        self.files.pop(operation['path'])
-                    if operation['method'] == 'mkdir':
-                        pass
-                    if operation['method'] == 'rmdir':
-                        pass
+                    parent_dir, _, name = operation['path'].rpartition('/')
+                    if operation['operation'] == 'create':
+                        if operation['type'] == 'file':
+                            self.paths[operation['path']] = FileData(
+                                id=operation['id'],
+                                size=operation['size'],
+                                checksum=operation['checksum'],
+                                server_num=operation['storage_server']
+                            )
+                            self.dir_tree[parent_dir]['files'].add(name)
+                        else:
+                            self.dir_tree[operation['path']]
+                            self.dir_tree[parent_dir]['dirs'].add(name)
+                    if operation['operation'] == 'remove':
+                        if operation['type'] == 'file':
+                            self.paths.pop(operation['path'])
+                            self.dir_tree[parent_dir]['files'].remove(name)
+                        else:
+                            self.dir_tree.pop(operation['path'])
+                            self.dir_tree[parent_dir]['dirs'].remove(name)
                     
         except json.JSONDecodeError:
             # empty log file
             pass
-
-        # remove any files on disk that are no longer in hash table
-        self.clean_orphans()
     
     def compact(self):
         checkpoint_data = {
-            'files': dict(),
-            'directories': list(self.directories),
+            'paths': {},
+            'dir_tree': {},
         }
 
-        for path, meta in self.files.items():
-            checkpoint_data['files'][path] = {
+        for path, meta in self.paths.items():
+            checkpoint_data['paths'][path] = {
                 'id': meta.id,
                 'size': meta.size,
                 'checksum': meta.checksum,
                 'storage_server': meta.storage_server
+            }
+        
+        for dir, entry in self.dir_tree.items():
+            checkpoint_data['dir_tree'][dir] = {
+                'dirs': sorted(entry['dirs']),
+                'files': sorted(entry['files'])
             }
 
         # write current data to new checkpoint
@@ -221,6 +256,7 @@ class NameServer():
                 # slice message out of buffer and respond
                 message = self.client_read_buffers[fd][HEADER_LEN:HEADER_LEN + self.client_msglens[fd]]
                 reply_bytes = self.response(message)
+                self.print_tree()
                 self.client_write_buffers[fd] = bytearray(reply_bytes)
 
                 # remove message from buffer and reset
@@ -292,8 +328,10 @@ class NameServer():
 
         # check if message is correctly formatted
         if 'method' not in rpc:
-            reply = {'result': 'Invalid message, no method provided', 'return': None}
+            reply = {'result': 'invalid message, no method provided', 'return': None}
             return json.dumps(reply).encode('utf-8')
+        
+        # to-do: resolve + validate path
 
         # perform method
         if rpc['method'] == 'ls':
@@ -312,163 +350,196 @@ class NameServer():
         # more methods to test out server functionality
         if rpc['method'] == 'compact':
             self.compact()
-            reply = {'result': 'Success', 'return': None}
+            reply = {'result': 'success', 'return': None}
             return json.dumps(reply).encode('utf-8')
         if rpc['method'] == 'clean':
             self.clean_orphans()
-            reply = {'result': 'Success', 'return': None}
+            reply = {'result': 'success', 'return': None}
             return json.dumps(reply).encode('utf-8')
         
         # method not found
-        reply = {'result': 'Invalid method', 'return': None}
+        reply = {'result': 'invalid method', 'return': None}
         return json.dumps(reply).encode('utf-8')
 
     def ls(self, client_path):
         # check that parameters exist
         if client_path is None:
-            reply = {'result': 'Invalid arguments for ls', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('invalid arguments for ls')
 
-        client_path = f'{client_path}/'
-        directory_files = set()
-
-        for path in self.files.keys():
-            if path.startswith(client_path):
-                directory_files.add(path.partition(client_path)[2].partition('/')[0])
-        
-        for path in self.directories:
-            if path.startswith(client_path):
-                directory_files.add(path.partition(client_path)[2].partition('/')[0])
+        dirs = sorted(self.dir_tree[client_path]['dirs'])
+        files = sorted(self.dir_tree[client_path]['files'])
         
         # return reply
-        reply = {'result': 'Success', 'return': sorted(list(directory_files))}
-        return json.dumps(reply).encode('utf-8')
+        return self.make_reply('success', [dirs, files])
 
     def cd(self, client_path, dest_dir):
         if client_path is None or dest_dir is None:
-            reply = {'result': 'Invalid arguments for cd', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('invalid arguments for cd')
 
-        dest_path = f'{client_path}/{dest_dir}'
-        reply = {'result': 'Success' if dest_path in self.directories else 'Failure', 'return': dest_path}
+        dest_path = self.child_path(client_path, dest_dir)
+        reply = {'result': 'success' if dest_dir in self.dir_tree[client_path]['dirs'] else 'failure', 'return': dest_path}
         return json.dumps(reply).encode('utf-8')
 
     def create(self, client_path, filename):
         if client_path is None or filename is None:
-            reply = {'result': 'Invalid arguments for create', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('invalid arguments for create')
+
+        if filename in self.dir_tree[client_path]['dirs']:
+            return self.make_reply('file name already taken by directory')
         
-        path = f'{client_path}/{filename}'
+        if filename in self.dir_tree[client_path]['files']:
+            return self.make_reply('success')
 
-        if path in self.directories:
-            reply = {'result': 'File name already taken by directory', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+        # crash safe ordering
+        path = self.child_path(client_path, filename)
+        file_id = uuid.uuid4().hex
+        storage_server = hash(path) % len(self.storage_servers)
+        
+        # 1. update log file
+        operation = {'operation': 'create',
+                        'type': 'file',
+                        'id': file_id,
+                        'path': path,
+                        'size': 0,
+                        'checksum': None,
+                        'storage_server': storage_server}
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
 
-        if path not in self.files:
-            # crash safe ordering
-            file_id = uuid.uuid4().hex
-            storage_server = hash(path) % len(self.storage_servers)
-            
-            # 1. update log file
-            operation = {'method': 'create',
-                         'path': path,
-                         'size': 0,
-                         'checksum': None,
-                         'storage_server': storage_server}
-            with open(self.log, 'a') as f:
-                f.write(json.dumps(operation) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        self.log_entries += 1
+        
+        # 2. add metadata to hash table in memory
+        self.paths[path] = FileData(file_id, 0, None, storage_server)
+        self.dir_tree[client_path]['files'].add(filename)
 
-                f.flush()
-                os.fsync(f.fileno())
-            self.log_entries += 1
-            
-            # 2. add metadata to hash table in memory
-            self.files[path] = FileData(file_id, 0, None, storage_server)
-
-        # return reply
-        reply = {'result': 'Success', 'return': None}
-        return json.dumps(reply).encode('utf-8')
+        return self.make_reply('success')
 
     def remove(self, client_path, filename):
         if client_path is None or filename is None:
-            reply = {'result': 'Invalid arguments for remove', 'return': None}
-            return json.dumps(reply).encode('utf-8')
-
-        path = f'{client_path}/{filename}'
-        if path in self.files:
-            # tell storage servers to remove
-            # to-do
+            return self.make_reply('invalid arguments for remove')
         
-            # crash safe ordering
-            # 1. update log file
-            operation = {'method': 'remove', 'path': path}
-            with open(self.log, 'a') as f:
-                f.write(json.dumps(operation) + '\n')
-
-                f.flush()
-                os.fsync(f.fileno())
-            self.log_entries += 1
-            
-            # 2. update hash table in memory
-            self.files.pop(path)
+        if filename in self.dir_tree[client_path]['dirs']:
+            return self.make_reply('cannot use remove on directory, use rmdir instead')
         
-        reply = {'result': 'Success', 'return': None}
-        return json.dumps(reply).encode('utf-8')
+        # makes operation idempotent
+        if filename not in self.dir_tree[client_path]['files']:
+            return self.make_reply('success')
+
+        # tell storage servers to remove
+        # to-do
+    
+        # crash safe ordering
+        # 1. update log file
+        path = self.child_path(client_path, filename)
+        operation = {'operation': 'remove', 'type': 'file', 'path': path}
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
+
+            f.flush()
+            os.fsync(f.fileno())
+        self.log_entries += 1
+        
+        # 2. update file structure in memory
+        self.paths.pop(path)
+        self.dir_tree[client_path]['files'].remove(filename)
+        
+        return self.make_reply('success')
 
     def mkdir(self, client_path, dirname):
         if client_path is None or dirname is None:
-            reply = {'result': 'Invalid arguments for mkdir', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('invalid arguments for mkdir')
 
-        dirpath = f'{client_path}/{dirname}'
+        if dirname in self.dir_tree[client_path]['files']:
+            return self.make_reply('directory name already taken by file')
 
-        if dirpath in self.files:
-            reply = {'result': 'Directory name already taken by file', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+        if dirname in self.dir_tree[client_path]['dirs']:
+            return self.make_reply('success')
 
-        if dirpath not in self.directories:
-            operation = {'method': 'mkdir', 'path': dirpath}
-            with open(self.log, 'a') as f:
-                f.write(json.dumps(operation) + '\n')
+        dirpath = self.child_path(client_path, dirname)
+        operation = {'operation': 'create', 'type': 'directory', 'path': dirpath}
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
 
-                f.flush()
-                os.fsync(f.fileno())
-            self.log_entries += 1
+            f.flush()
+            os.fsync(f.fileno())
+        self.log_entries += 1
 
-            self.directories.add(dirpath)
+        self.dir_tree[dirpath]
+        self.dir_tree[client_path]['dirs'].add(dirname)
         
-        reply = {'result': 'Success', 'return': None}
-        return json.dumps(reply).encode('utf-8')
+        return self.make_reply('success')
     
     def rmdir(self, client_path, dirname):
         if client_path is None or dirname is None:
-            reply = {'result': 'Invalid arguments for rmdir', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('invalid arguments for rmdir')
 
-        dirpath = f'{client_path}/{dirname}'
-
-        if dirpath in self.directories:
-            operation = {'method': 'remove', 'path': dirpath}
-            with open(self.log, 'a') as f:
+        if dirname in self.dir_tree[client_path]['files']:
+            return self.make_reply('cannot use rmdir on file, use remove instead')
+        
+        if dirname not in self.dir_tree[client_path]['dirs']:
+            return self.make_reply('success')
+        
+        # postorder dfs adds children, then parents so we remove in safe order
+        recursive_files = []
+        recursive_dirs = []
+        def walk(current_dir):
+            for file in self.dir_tree[current_dir]['files']:
+                recursive_files.append(self.child_path(current_dir, file))
+            
+            for dirname in self.dir_tree[current_dir]['dirs']:
+                dirpath = self.child_path(current_dir, dirname)
+                walk(dirpath)
+            
+            recursive_dirs.append(current_dir)
+        
+        dirpath = self.child_path(client_path, dirname)
+        walk(dirpath)
+        
+        # log all removes
+        with open(self.log, 'a') as f:
+            for path in recursive_files:
+                operation = {'operation': 'remove', 'type': 'file', 'path': path}
+                f.write(json.dumps(operation) + '\n')
+            for path in recursive_dirs:
+                operation = {'operation': 'remove', 'type': 'directory', 'path': path}
                 f.write(json.dumps(operation) + '\n')
 
-                f.flush()
-                os.fsync(f.fileno())
-            self.log_entries += 1
+            f.flush()
+            os.fsync(f.fileno())
+        self.log_entries += len(recursive_files) + len(recursive_dirs)
 
-            # remove all files in that directory
-            for path in self.files.keys():
-                if path.startswith(dirpath):
-                    self.files.pop(path)
+        print(recursive_files)
+        print(recursive_dirs)
+
+        # return self.make_reply('success')
         
-            for path in self.directories:
-                if path.startswith(dirpath):
-                    self.directories.remove(path)
-            
-            self.directories.remove(dirpath)
+        # remove from memory
+        for path in recursive_files:
+            parent_dir, _, filename = path.rpartition('/')
+            self.paths.pop(path)
+            self.dir_tree[parent_dir]['files'].remove(filename)
+        for path in recursive_dirs:
+            parent_dir, _, child_dir = path.rpartition('/')
+            self.dir_tree.pop(path)
+            self.dir_tree[parent_dir]['dirs'].remove(child_dir)
         
-        reply = {'result': 'Success', 'return': None}
-        return json.dumps(reply).encode('utf-8')
+        return self.make_reply('success')
+
+    def child_path(self, parent_dir, name):
+        return f'{parent_dir}/{name}'
+
+    def resolve_path(self, input_path):
+        if input_path.startswith('/'): # absolute path
+            pass
+        pass
+
+    def print_tree(self):
+        print(json.dumps(self.dir_tree, indent=4, sort_keys=True, default=str))
+    
+    def make_reply(self, result, value=None):
+        return json.dumps({'result': result, 'return': value}).encode('utf-8')
 
     def run(self):
         threading.Thread(target=self.update_register, daemon=True).start()

@@ -1,0 +1,6 @@
+mkdir docs
+ls
+cd docs
+pwd
+ls
+exit

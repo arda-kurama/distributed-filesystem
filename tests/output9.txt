@@ -1,0 +1,2 @@
+cannot use remove on directory, use rmdir instead
+cannot use rmdir on file, use remove instead

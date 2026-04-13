@@ -1,0 +1,7 @@
+mkdir docs
+cd docs
+create a.txt
+cd ..
+rmdir docs
+ls
+exit

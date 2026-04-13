@@ -1,0 +1,7 @@
+mkdir docs
+cd docs
+create report.txt
+create notes.txt
+ls
+pwd
+exit

@@ -1,0 +1,10 @@
+mkdir docs
+cd docs
+mkdir sub
+cd sub
+pwd
+cd ..
+pwd
+cd ..
+pwd
+exit

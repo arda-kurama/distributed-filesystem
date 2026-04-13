@@ -13,10 +13,9 @@ BUFSIZE = 1024
 HEADER_LEN = 4
 
 class Client:
-    def __init__(self, user_name, project_name, name_server, verbose):
+    def __init__(self, user_name, project_name, verbose):
         self.user_name = user_name
         self.project_name = project_name
-        self.name_server = name_server
         self.path = ''
         self.verbose = verbose
 
@@ -32,18 +31,16 @@ class Client:
 
             args = input.split(' ')
             command = args[0]
+
+            if command == 'exit':
+                return
             
             self.handle_command(command, args)
     
     def handle_command(self, command, args):
         match command:
             case 'ls':
-                files = self.name_server.ls(self.path)
-
-                if len(files) != 0:
-                    for file in files:
-                        print(file, end='    ')
-                    print()
+                self.ls()
 
             case 'cd':
                 if len(args) > 2:
@@ -63,52 +60,28 @@ class Client:
                     print('usage: create [file]')
                     return
                 
-                # is this idempotent?
-                file = args[1]
-                self.name_server.create(self.path, file)
-                if self.verbose:
-                    print(f'created file {file}')
+                self.create(args[1])
             
             case 'remove':
                 if len(args) != 2:
                     print('usage: remove [file]')
                     return
-
-                filename = args[1]
-
-                self.name_server.remove(self.path, filename)
-                if self.verbose:
-                    print(f'removed file {filename}')
+                
+                self.remove(args[1])
                 
             case 'mkdir':
                 if len(args) != 2:
                     print('usage: mkdir [directory]')
                     return
 
-                dirname = args[1]
-
-                if not self.valid_filename(dirname):
-                    print(f'{dirname} not a valid directory name')
-                    return
-                
-                self.name_server.mkdir(self.path, dirname)
-                if self.verbose:
-                    print(f'created directory {dirname}')
+                self.mkdir(args[1])
             
-            case 'mkdir':
+            case 'rmdir':
                 if len(args) != 2:
                     print('usage: rmdir [directory]')
                     return
 
-                dirname = args[1]
-
-                if not self.valid_filename(dirname):
-                    print(f'{dirname} not a valid directory name')
-                    return
-                
-                self.name_server.rmdir(self.path, dirname)
-                if self.verbose:
-                    print(f'removed directory {dirname}')
+                self.rmdir(args[1])
 
             case 'open':
                 if len(args) != 2:
@@ -120,6 +93,13 @@ class Client:
             
             case 'clear':
                 os.system('clear')
+            
+            case 'compact':
+                message = {
+                    'method': 'compact'
+                }
+
+                reply = self.rpc(message)
             
             case _:
                 print('invalid command')
@@ -136,15 +116,19 @@ class Client:
 
         reply = self.rpc(message)
 
-        if reply['result'] != 'Success':
+        if reply['result'] != 'success':
             raise RuntimeError(f'ls error: {reply['result']}')
         else:
-            files = reply['return']
+            dirs, files = reply['return']
 
-            if len(files) != 0:
-                for file in files:
-                    print(file, end='    ')
-                print()
+            if len(files) == 0 and len(dirs) == 0:
+                return
+
+            for dir in dirs:
+                print(f'\033[1;32;40m{dir}\033[0m', end='\t') # for directories
+            for file in files:
+                print(file, end='\t')
+            print()
 
     def cd(self, dest_dir):
         if dest_dir is None: # go to root directory
@@ -173,7 +157,7 @@ class Client:
 
         reply = self.rpc(message)
 
-        if reply['result'] != 'Success':
+        if reply['result'] != 'success':
             print(f'directory {dest_dir} does not exist')
         else:
             self.path = reply['return']
@@ -181,16 +165,72 @@ class Client:
                 print(f'new path: {self.path}')
 
     def create(self, filename):
-        pass
+        message = {
+            'method': 'create',
+            'path': self.path,
+            'filename': filename
+        }
+
+        reply = self.rpc(message)
+
+        if reply['result'] != 'success':
+            raise RuntimeError(f'create error: {reply['result']}')
+        
+        if self.verbose:
+            print(f'created file: {filename}')
 
     def remove(self, filename):
-        pass
+        message = {
+            'method': 'remove',
+            'path': self.path,
+            'filename': filename
+        }
+
+        reply = self.rpc(message)
+
+        if reply['result'] != 'success':
+            raise RuntimeError(f'remove error: {reply['result']}')
+        
+        if self.verbose:
+            print(f'removed file: {filename}')
 
     def mkdir(self, dirname):
-        pass
+        if not self.valid_filename(dirname):
+            print(f'{dirname} not a valid directory name')
+            return
+        
+        message = {
+            'method': 'mkdir',
+            'path': self.path,
+            'dirname': dirname
+        }
+
+        reply = self.rpc(message)
+
+        if reply['result'] != 'success':
+            raise RuntimeError(f'mkdir error: {reply['result']}')
+        
+        if self.verbose:
+            print(f'created directory {dirname}')
     
     def rmdir(self, dirname):
-        pass
+        if not self.valid_filename(dirname):
+            print(f'{dirname} not a valid directory name')
+            return
+        
+        message = {
+            'method': 'rmdir',
+            'path': self.path,
+            'dirname': dirname
+        }
+
+        reply = self.rpc(message)
+        
+        if reply['result'] != 'success':
+            raise RuntimeError(f'rmdir error: {reply['result']}')
+        
+        if self.verbose:
+            print(f'removed directory {dirname}')
 
     def connect(self, hostname, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -209,13 +249,13 @@ class Client:
         server = None
         time = 0
         for entry in entries:
-            if entry.get('type') == 'hashtable' and entry.get('project') == self.project_name:
+            if entry.get('type') == 'name_server' and entry.get('project') == self.project_name:
                 if entry['lastheardfrom'] > time:
                     server = entry
                     time = entry['lastheardfrom']
 
         if not server:
-            raise RuntimeError(f'Error: no hashtable server not found with name \'{self.project_name}\'')
+            raise RuntimeError(f'Error: no name server found with name \'{self.project_name}\'')
         
         return (server['name'], server['port'])
     
@@ -269,7 +309,7 @@ class Client:
         
                 # send
                 if self.very_verbose:
-                    print('Receiving response...')
+                    print('Sending message...')
                 message_bytes = json.dumps(message).encode('utf-8')
                 self.send_message(message_bytes)
                 # if self.verbose:
@@ -305,9 +345,16 @@ class Client:
 
 
 def main():
-    project = 'filesys'
-    n = NameServer(project)
-    c = Client('qhynes', project, n, False)
+    if len(sys.argv) != 2:
+        raise RuntimeError('Usage: python Client.py [project_name]')
+
+    # if len(sys.argv) == 4 and sys.argv[2] == '-test':
+    #     testfile = sys.argv[3]
+    
+
+    
+    c = Client('qhynes', sys.argv[1], False)
+    c.very_verbose = False
     c.run_shell()
 
 if __name__ == '__main__':

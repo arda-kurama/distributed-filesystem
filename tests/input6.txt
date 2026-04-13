@@ -1,0 +1,11 @@
+mkdir docs
+cd docs
+create a.txt
+mkdir sub
+cd sub
+create b.txt
+cd ..
+ls
+cd sub
+ls
+exit
