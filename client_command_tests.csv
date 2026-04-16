@@ -1,0 +1,79 @@
+test_id,step,command,expected_success,expected_output,notes
+0,1,pwd,True,/,Initial root state
+0,2,ls,True,,
+1,1,mkdir docs,True,created directory docs,mkdir / ls / cd / pwd
+1,2,ls,True,[1;32;40mdocs[0m ,
+1,3,cd docs,True,new path: /docs,
+1,4,pwd,True,/docs,
+1,5,ls,True,,
+2,1,create a.txt,True,created file: a.txt,create / remove file in root
+2,2,ls,True,a.txt ,
+2,3,remove a.txt,True,removed file: a.txt,
+2,4,ls,True,,
+3,1,mkdir docs,True,created directory docs,multiple files in one directory
+3,2,cd docs,True,new path: /docs,
+3,3,create report.txt,True,created file: report.txt,
+3,4,create notes.txt,True,created file: notes.txt,
+3,5,ls,True,notes.txt report.txt ,
+3,6,pwd,True,/docs,
+4,1,mkdir docs,True,created directory docs,file-vs-directory name collision
+4,2,create docs,False,file name already taken by directory,
+4,3,cd docs,True,new path: /docs,
+4,4,mkdir sub,True,created directory sub,
+4,5,ls,True,[1;32;40msub[0m ,
+5,1,create notes.txt,True,created file: notes.txt,missing file and bad cd behavior as currently implemented
+5,2,mkdir notes.txt,False,directory name already taken by file,
+5,3,remove missing.txt,True,removed file: missing.txt,
+5,4,cd missing,False,failure,
+6,1,mkdir docs,True,created directory docs,nested directories and ls at different levels
+6,2,cd docs,True,new path: /docs,
+6,3,create a.txt,True,created file: a.txt,
+6,4,mkdir sub,True,created directory sub,
+6,5,cd sub,True,new path: /docs/sub,
+6,6,create b.txt,True,created file: b.txt,
+6,7,cd ..,True,new path: /docs,
+6,8,ls,True,[1;32;40msub[0m a.txt ,
+6,9,cd sub,True,new path: /docs/sub,
+6,10,ls,True,b.txt ,
+7,1,mkdir docs,True,created directory docs,recursive rmdir
+7,2,cd docs,True,new path: /docs,
+7,3,create a.txt,True,created file: a.txt,
+7,4,cd ..,True,new path: ,
+7,5,rmdir docs,True,removed directory docs,
+7,6,ls,True,,
+8,1,mkdir docs,True,created directory docs,cd .. and pwd behavior
+8,2,cd docs,True,new path: /docs,
+8,3,mkdir sub,True,created directory sub,
+8,4,cd sub,True,new path: /docs/sub,
+8,5,pwd,True,/docs/sub,
+8,6,cd ..,True,new path: /docs,
+8,7,pwd,True,/docs,
+8,8,cd ..,True,new path: ,
+8,9,pwd,True,/,
+9,1,mkdir docs,True,created directory docs,wrong-command-type errors using resolved paths
+9,2,cd docs,True,new path: /docs,
+9,3,create a.txt,True,created file: a.txt,
+9,4,cd ..,True,new path: ,
+9,5,remove docs,False,"cannot use remove on directory, use rmdir instead",
+9,6,rmdir docs/a.txt,False,"cannot use rmdir on file, use remove instead",
+10,1,resolve a,True,/a,path resolution from root
+10,2,resolve a/b,True,/a/b,
+10,3,resolve /a,True,/a,
+10,4,resolve .,True,,
+10,5,resolve ..,True,,
+11,1,cwd /docs/sub,True,new path: /docs/sub,path resolution with multiple .. and absolute paths
+11,2,resolve .,True,/docs/sub,
+11,3,resolve ..,True,/docs,
+11,4,resolve ../a,True,/docs/a,
+11,5,resolve ../../x,True,/x,
+11,6,resolve /a/b/../c,True,/a/c,
+11,7,resolve ../../../..,True,,
+12,1,cwd /docs,True,new path: /docs,path resolution with repeated slashes and mixed . / ..
+12,2,resolve a//b//c,True,/docs/a/b/c,
+12,3,resolve /a//b//,True,/a/b,
+12,4,resolve ./c/../d,True,/docs/d,
+12,5,resolve .././../x,True,/x,
+13,1,resolve bad$name,False,invalid path,invalid path characters rejected client-side
+13,2,resolve a/../../bad$name,False,invalid path,
+13,3,create bad$name,False,invalid path,
+13,4,mkdir bad$name,False,invalid path,

@@ -4,8 +4,8 @@ import struct
 import json
 import http.client
 import time
-import hashlib
 import os
+import re
 
 from NameServer import NameServer
 
@@ -18,6 +18,7 @@ class Client:
         self.project_name = project_name
         self.path = ''
         self.verbose = verbose
+        self.very_verbose = False
 
     def connect(self):
         pass
@@ -35,64 +36,90 @@ class Client:
             if command == 'exit':
                 return
             
-            self.handle_command(command, args)
+            successful, output = self.handle_command(command, args)
+            print(successful, output)
+            if self.verbose or not successful:
+                print(output, end='\n' if output != '' else '')
     
     def handle_command(self, command, args):
         match command:
             case 'ls':
-                self.ls()
+                path = self.parse_args(args, 'usage: ls [path to dir]', self.path)
+                if path is False:
+                    return False, 'invalid path'
+                return self.ls(path)
 
             case 'cd':
-                if len(args) > 2:
-                    print('usage: cd / cd [directory]')
-                    return
-                
-                self.cd(args[1] if len(args) == 2 else None)
+                path = self.parse_args(args, 'usage: cd [path to dir]')
+                if path is False:
+                    return False, 'invalid path'
+                return self.cd(path)
                     
             case 'pwd':
-                if self.path == '':
-                    print('/')
-                else:
-                    print(self.path)
+                return True, self.path if self.path != '' else '/'
             
             case 'create':
-                if len(args) != 2:
-                    print('usage: create [file]')
-                    return
-                
-                self.create(args[1])
+                path = self.parse_args(args, 'usage: create [path to file]', None)
+                if path is False:
+                    return False, 'invalid path'
+                path, _, filename = path.rpartition('/')
+                return self.create(path, filename)
             
             case 'remove':
-                if len(args) != 2:
-                    print('usage: remove [file]')
-                    return
-                
-                self.remove(args[1])
+                path = self.parse_args(args, 'usage: remove [path to file]', None)
+                if path is False:
+                    return False, 'invalid path'
+                path, _, filename = path.rpartition('/')
+                return self.remove(path, filename)
                 
             case 'mkdir':
-                if len(args) != 2:
-                    print('usage: mkdir [directory]')
-                    return
-
-                self.mkdir(args[1])
+                path = self.parse_args(args, 'usage: mkdir [path to dir]', None)
+                if path is False:
+                    return False, 'invalid path'
+                path, _, dirname = path.rpartition('/')
+                return self.mkdir(path, dirname)
             
             case 'rmdir':
-                if len(args) != 2:
-                    print('usage: rmdir [directory]')
-                    return
-
-                self.rmdir(args[1])
+                path = self.parse_args(args, 'usage: rmdir [path to dir]', None)
+                if path is False:
+                    return False, 'invalid path'
+                path, _, dirname = path.rpartition('/')
+                return self.rmdir(path, dirname)
 
             case 'open':
-                if len(args) != 2:
-                    print('usage: open [file]')
-                    return
+                path = self.parse_args(args, 'usage: open [path to file]', None)
+                if path is False:
+                    return False, 'invalid path'
+                path, _, dirname = path.rpartition('/')
 
                 # get storage server to connect to from name server
-                pass
+                # vim interface
+                # - allows you to read/edit file
+                # - can save changes, pass them along to storage servers
+
+                return True, ''
             
             case 'clear':
                 os.system('clear')
+                return True, ''
+            
+            case 'cwd':
+                self.path = self.parse_args(args, 'usage: cwd [absolute path]')
+                return True, f'new path: {self.path}'
+            
+            case 'resolve':
+                path = self.parse_args(args, 'usage: resolve [path]')
+                if path is False:
+                    return False, 'invalid path'
+                return True, path
+            
+            case 'tree':
+                message = {
+                    'method': 'tree'
+                }
+
+                reply = self.rpc(message)
+                return True, ''
             
             case 'compact':
                 message = {
@@ -100,137 +127,110 @@ class Client:
                 }
 
                 reply = self.rpc(message)
+                return True, ''
+
+            case 'restart':
+                message = {
+                    'method': 'restart'
+                }
+
+                reply = self.rpc(message)
+                return True, ''
             
             case _:
-                print('invalid command')
-            
-            # vim interface
-            # - allows you to read/edit file
-            # - can save changes, pass them along to storage servers
+                return False, 'invalid command'
     
-    def ls(self):
+    # every command returns status (True/False), along with output
+    def ls(self, path):
         message = {
             'method': 'ls',
-            'path': self.path
+            'path': path
         }
 
         reply = self.rpc(message)
 
         if reply['result'] != 'success':
-            raise RuntimeError(f'ls error: {reply['result']}')
+            return False, f'ls error: {reply['result']}'
         else:
             dirs, files = reply['return']
 
-            if len(files) == 0 and len(dirs) == 0:
-                return
-
+            output = ''
             for dir in dirs:
-                print(f'\033[1;32;40m{dir}\033[0m', end='\t') # for directories
+                output += f'\033[1;32;40m{dir}\033[0m ' # for directories
             for file in files:
-                print(file, end='\t')
-            print()
+                output += file + ' '
+        
+        return True, output
 
-    def cd(self, dest_dir):
-        if dest_dir is None: # go to root directory
-            self.path = ''
-            if self.verbose:
-                print(f'new path: {self.path}')
-            return
-        
-        if dest_dir == '..': # move up directory
-            if self.path == '':
-                return
-            self.path = self.path.rpartition('/')[0]
-            if self.verbose:
-                print(f'new path: {self.path}')
-            return
-        
-        if not self.valid_filename(dest_dir):
-            print(f'directory {dest_dir} does not exist')
-            return
-        
+    def cd(self, path):
         message = {
             'method': 'cd',
-            'path': self.path,
-            'dest_dir': dest_dir
+            'path': path,
         }
 
         reply = self.rpc(message)
 
         if reply['result'] != 'success':
-            print(f'directory {dest_dir} does not exist')
-        else:
-            self.path = reply['return']
-            if self.verbose:
-                print(f'new path: {self.path}')
+            return False, reply['result']
+        
+        self.path = reply['return']
+        return True, f'new path: {self.path}'
 
-    def create(self, filename):
+    def create(self, path, filename):
         message = {
             'method': 'create',
-            'path': self.path,
+            'path': path,
             'filename': filename
         }
 
         reply = self.rpc(message)
 
         if reply['result'] != 'success':
-            raise RuntimeError(f'create error: {reply['result']}')
+            return False, reply['result']
         
-        if self.verbose:
-            print(f'created file: {filename}')
+        return True, f'created file: {filename}'
 
-    def remove(self, filename):
+    def remove(self, path, filename):
         message = {
             'method': 'remove',
-            'path': self.path,
+            'path': path,
             'filename': filename
         }
 
         reply = self.rpc(message)
 
         if reply['result'] != 'success':
-            raise RuntimeError(f'remove error: {reply['result']}')
+            return False, reply['result']
         
-        if self.verbose:
-            print(f'removed file: {filename}')
+        return True, f'removed file: {filename}'
 
-    def mkdir(self, dirname):
-        if not self.valid_filename(dirname):
-            print(f'{dirname} not a valid directory name')
-            return
-        
+    def mkdir(self, path, dirname):
         message = {
             'method': 'mkdir',
-            'path': self.path,
+            'path': path,
             'dirname': dirname
         }
 
         reply = self.rpc(message)
 
         if reply['result'] != 'success':
-            raise RuntimeError(f'mkdir error: {reply['result']}')
+            return False, reply['result']
         
-        if self.verbose:
-            print(f'created directory {dirname}')
+        return True, f'created directory {dirname}'
     
-    def rmdir(self, dirname):
-        if not self.valid_filename(dirname):
-            print(f'{dirname} not a valid directory name')
-            return
-        
+    def rmdir(self, path, dirname):
         message = {
             'method': 'rmdir',
-            'path': self.path,
+            'path': path,
             'dirname': dirname
         }
 
         reply = self.rpc(message)
-        
+
         if reply['result'] != 'success':
-            raise RuntimeError(f'rmdir error: {reply['result']}')
+            return False, reply['result']
         
-        if self.verbose:
-            print(f'removed directory {dirname}')
+        return True, f'removed directory {dirname}'
 
     def connect(self, hostname, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -338,9 +338,63 @@ class Client:
                 attempts += 1
 
         return reply
+    
+    def parse_args(self, args, usage_msg, default=''):
+        if len(args) > 2:
+            print(usage_msg)
+            return False
+        
+        if len(args) == 1:
+            if default is None:
+                print(usage_msg)
+                return False
+            else:
+                return default
+        else:
+            return self.resolve_path(args[1])
+
+    # def validate_path(self, input_path):
+    #     return bool(re.search(r'^(\.|\.\.)?/?(((?!\.{1,2})[\w\.]+|\.\.)/)*(?!\.{1,2})[\w\.]+/?$', input_path))
+
+    def resolve_path(self, input_path):
+        input_levels = input_path.rstrip('/').split('/')
+        path_levels = self.path.rstrip('/').split('/')
+        if input_path.startswith('/'): # absolute path
+            resolved_levels = ['']
+            for l in input_levels:
+                if l == '':
+                    continue
+                elif l == '.':
+                    continue
+                elif l == '..':
+                    # don't go any higher if at root
+                    if resolved_levels[-1] != '':
+                        resolved_levels.pop()
+                else:
+                    if not self.valid_filename(l):
+                        return False
+                    resolved_levels.append(l)
+        else: # relative path
+            resolved_levels = path_levels
+            for l in input_levels:
+                if l == '':
+                    continue
+                elif l == '.':
+                    continue
+                elif l == '..':
+                    if resolved_levels[-1] != '':
+                        resolved_levels.pop()
+                else:
+                    if not self.valid_filename(l):
+                        return False
+                    resolved_levels.append(l)
+        print(resolved_levels)
+        return '/'.join(resolved_levels)
 
     def valid_filename(self, filename):
-        allowed = 'abcdefhijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-0123456789'
+        if filename == '.' or filename == '..':
+            return False
+        allowed = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-0123456789'
         return all(char in allowed for char in filename)
 
 
@@ -348,13 +402,8 @@ def main():
     if len(sys.argv) != 2:
         raise RuntimeError('Usage: python Client.py [project_name]')
 
-    # if len(sys.argv) == 4 and sys.argv[2] == '-test':
-    #     testfile = sys.argv[3]
-    
-
-    
     c = Client('qhynes', sys.argv[1], False)
-    c.very_verbose = False
+    # c.very_verbose = False
     c.run_shell()
 
 if __name__ == '__main__':

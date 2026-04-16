@@ -25,13 +25,12 @@ class FileData:
 class NameServer():
     def __init__(self, project_name):
         self.project_name = project_name
-        # to-do: update files and directories data structures to speed up rpc's
         self.paths = dict() # path -> FileData()
         self.dir_tree = defaultdict(lambda: {
             'dirs': set(),
             'files': set(),
         })
-        # structure:
+        # example structure:
         # dir_tree = {
         #     '/': {
         #         'dirs': {'docs', 'tmp'},
@@ -46,6 +45,7 @@ class NameServer():
         #         'files': set(),
         #     },
         # }
+
         self.storage_servers = [None]
 
         # initialize files and directories using checkpoint and log files
@@ -256,7 +256,7 @@ class NameServer():
                 # slice message out of buffer and respond
                 message = self.client_read_buffers[fd][HEADER_LEN:HEADER_LEN + self.client_msglens[fd]]
                 reply_bytes = self.response(message)
-                self.print_tree()
+                # self.print_tree()
                 self.client_write_buffers[fd] = bytearray(reply_bytes)
 
                 # remove message from buffer and reset
@@ -311,33 +311,19 @@ class NameServer():
         self.epoll.close()
         self.server_socket.close()
         self.udp_sock.close()
-    
-    # don't need? there are no files on disk for the name server
-    # def clean_orphans(self):
-    #     # get dict of filepaths in hash table
-    #     active_files = {meta.path for meta in self.ht.data.values()}
-
-    #     # remove any files on disk that aren't in ht
-    #     for name in os.listdir(self.data_dir):
-    #         path = os.path.join(self.data_dir, name)
-    #         if path not in active_files:
-    #             os.remove(path)
 
     def response(self, message):
         rpc = json.loads(message.decode('utf-8'))
 
         # check if message is correctly formatted
         if 'method' not in rpc:
-            reply = {'result': 'invalid message, no method provided', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('invalid message, no method provided')
         
-        # to-do: resolve + validate path
-
         # perform method
         if rpc['method'] == 'ls':
             return self.ls(rpc.get('path'))
         if rpc['method'] == 'cd':
-            return self.cd(rpc.get('path'), rpc.get('dest_dir'))
+            return self.cd(rpc.get('path'))
         if rpc['method'] == 'create':
             return self.create(rpc.get('path'), rpc.get('filename'))
         if rpc['method'] == 'remove':
@@ -350,16 +336,16 @@ class NameServer():
         # more methods to test out server functionality
         if rpc['method'] == 'compact':
             self.compact()
-            reply = {'result': 'success', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('success')
         if rpc['method'] == 'clean':
             self.clean_orphans()
-            reply = {'result': 'success', 'return': None}
-            return json.dumps(reply).encode('utf-8')
+            return self.make_reply('success')
+        if rpc['method'] == 'tree':
+            self.print_tree()
+            return self.make_reply('success')
         
         # method not found
-        reply = {'result': 'invalid method', 'return': None}
-        return json.dumps(reply).encode('utf-8')
+        return self.make_reply('invalid method')
 
     def ls(self, client_path):
         # check that parameters exist
@@ -372,12 +358,11 @@ class NameServer():
         # return reply
         return self.make_reply('success', [dirs, files])
 
-    def cd(self, client_path, dest_dir):
-        if client_path is None or dest_dir is None:
+    def cd(self, dest_dir):
+        if dest_dir is None:
             return self.make_reply('invalid arguments for cd')
 
-        dest_path = self.child_path(client_path, dest_dir)
-        reply = {'result': 'success' if dest_dir in self.dir_tree[client_path]['dirs'] else 'failure', 'return': dest_path}
+        reply = {'result': 'success' if dest_dir in self.dir_tree else 'failure', 'return': dest_dir}
         return json.dumps(reply).encode('utf-8')
 
     def create(self, client_path, filename):
@@ -529,11 +514,6 @@ class NameServer():
 
     def child_path(self, parent_dir, name):
         return f'{parent_dir}/{name}'
-
-    def resolve_path(self, input_path):
-        if input_path.startswith('/'): # absolute path
-            pass
-        pass
 
     def print_tree(self):
         print(json.dumps(self.dir_tree, indent=4, sort_keys=True, default=str))

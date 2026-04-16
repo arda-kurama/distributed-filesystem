@@ -1,5 +1,0 @@
-create notes.txt
-mkdir notes.txt
-remove missing.txt
-cd missing
-exit

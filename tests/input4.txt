@@ -1,6 +1,0 @@
-mkdir docs
-create docs
-cd docs
-mkdir sub
-ls
-exit
