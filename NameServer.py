@@ -15,6 +15,7 @@ BUFSIZE = 4096
 HEADER_LEN = 4
 REGISTER_UPDATE_PERIOD = 60
 HEARTBEAT_TIMEOUT = 60
+REPLICA_COUNT = 3
 
 # metadata for files stored in NameServer paths
 class FileData:
@@ -441,18 +442,26 @@ class NameServer():
         path = self.child_path(client_path, filename)
         file_id = uuid.uuid4().hex
 
-        storage_server = self.choose_storage_server(path)
-        if storage_server is None:
+        storage_servers = self.choose_storage_servers(path)
+        if not storage_servers:
             return self.make_reply('no storage servers available')
         
-        reply = self.rpc_storage_server(storage_server, {
-            'method': 'create',
-            'id': file_id,
-            'path': path,
-        })
+        created_on = []
+        for id in storage_servers:
+            try:
+                reply = self.rpc_storage_server(id, {
+                    'method': 'create',
+                    'id': file_id,
+                    'path': path,
+                })
 
-        if reply['result'] != 'success':
-            return self.make_reply(f"storage create failed: {reply['result']}")
+                if reply['result'] == 'success':
+                    created_on.append(id)
+            except:
+                pass
+        
+        if not created_on:
+            return self.make_reply('file not created on any storage servers')
         
         # 1. update log file
         operation = {'operation': 'create',
@@ -460,7 +469,7 @@ class NameServer():
                         'id': file_id,
                         'path': path,
                         'owner': None,
-                        'servers': [storage_server],
+                        'servers': created_on,
                         'permissions': 'owner'}
         with open(self.log, 'a') as f:
             f.write(json.dumps(operation) + '\n')
@@ -470,7 +479,7 @@ class NameServer():
         self.log_entries += 1
         
         # 2. add metadata to hash table in memory
-        self.paths[path] = FileData(file_id, path, None, [storage_server], 'owner')
+        self.paths[path] = FileData(file_id, path, None, created_on, 'owner')
         self.dir_tree[client_path]['files'].add(filename)
 
         return self.make_reply('success')
@@ -486,12 +495,15 @@ class NameServer():
         if filename not in self.dir_tree[client_path]['files']:
             return self.make_reply('success')
 
+        path = self.child_path(client_path, filename)
+
         # tell storage servers to remove
-        # to-do
+        failed = self.delete_file_replicas(path)
+        if failed:
+            return self.make_reply(f'remove failed on replicas: {failed}')
     
         # crash safe ordering
         # 1. update log file
-        path = self.child_path(client_path, filename)
         operation = {'operation': 'remove', 'type': 'file', 'path': path}
         with open(self.log, 'a') as f:
             f.write(json.dumps(operation) + '\n')
@@ -555,10 +567,13 @@ class NameServer():
         
         dirpath = self.child_path(client_path, dirname)
         walk(dirpath)
-        
+
         # log all removes
         with open(self.log, 'a') as f:
             for path in recursive_files:
+                failed = self.delete_file_replicas(path)
+                if failed:
+                    return self.make_reply(f'remove failed on replicas: {failed}')
                 operation = {'operation': 'remove', 'type': 'file', 'path': path}
                 f.write(json.dumps(operation) + '\n')
             for path in recursive_dirs:
@@ -601,6 +616,24 @@ class NameServer():
             'host': ss.host,
             'port': ss.port
         })
+
+    def delete_file_replicas(self, path):
+        meta = self.paths[path]
+        failed = []
+
+        for server_id in meta.servers:
+            try:
+                reply = self.rpc_storage_server(server_id, {
+                    'method': 'remove',
+                    'id': meta.id,
+                    'path': path
+                })
+                if reply['result'] != 'success':
+                    failed.append((server_id, reply['result']))
+            except Exception as e:
+                failed.append((server_id, str(e)))
+
+        return failed
 
     def child_path(self, parent_dir, name):
         return f'{parent_dir}/{name}'
@@ -690,6 +723,31 @@ class NameServer():
         if not live_ids:
             return None
         return live_ids[hash(path) % len(live_ids)]
+    
+    def choose_storage_servers(self, path, replica_count=REPLICA_COUNT):
+        if not self.storage_servers:
+            return None
+
+        live_ids = sorted(id for id, info in self.storage_servers.items() if info.alive)
+
+        if not live_ids:
+            return None
+
+        if len(live_ids) <= replica_count:
+            return live_ids[:]
+
+        digest = hashlib.sha256(path.encode('utf-8')).digest()
+        start = int.from_bytes(digest[:8], 'big') % len(live_ids)
+
+        chosen = []
+        for i in range(len(live_ids)):
+            sid = live_ids[(start + i) % len(live_ids)]
+            if sid not in chosen:
+                chosen.append(sid)
+            if len(chosen) == replica_count:
+                break
+
+        return chosen
 
     def reap_storage_servers(self):
         now = time.time()

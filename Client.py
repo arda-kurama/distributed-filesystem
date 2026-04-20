@@ -15,8 +15,8 @@ from NameServer import NameServer
 HEADER_LEN = 4
 
 class Client:
-    def __init__(self, user_name, project_name, verbose):
-        self.user_name = user_name
+    def __init__(self, username, project_name, verbose):
+        self.username = username
         self.project_name = project_name
         self.path = ''
         self.verbose = verbose
@@ -26,7 +26,7 @@ class Client:
         os.system('clear')
         os.system('clear')
         while 1:
-            print(f'{self.user_name}:{self.path} %', end=' ', flush=True)
+            print(f'{self.username}:{self.path} %', end=' ', flush=True)
             input = sys.stdin.readline().strip()
 
             args = input.split(' ')
@@ -143,6 +143,7 @@ class Client:
     def ls(self, path):
         message = {
             'method': 'ls',
+            'user': self.username,
             'path': path
         }
 
@@ -500,10 +501,13 @@ class Client:
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise RuntimeError('Usage: python Client.py [project_name]')
+    if len(sys.argv) != 3:
+        raise RuntimeError('Usage: python Client.py [project_name] [username]')
+    
+    project_name = sys.argv[1]
+    username = sys.argv[2]
 
-    c = Client('qhynes', sys.argv[1], False)
+    c = Client(username, project_name, False)
     # c.very_verbose = False
     c.run_shell()
 
