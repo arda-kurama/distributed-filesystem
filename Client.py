@@ -9,7 +9,6 @@ import re
 
 from NameServer import NameServer
 
-BUFSIZE = 1024
 HEADER_LEN = 4
 
 class Client:
@@ -19,9 +18,6 @@ class Client:
         self.path = ''
         self.verbose = verbose
         self.very_verbose = False
-
-    def connect(self):
-        pass
     
     def run_shell(self):
         os.system('clear')
@@ -37,9 +33,10 @@ class Client:
                 return
             
             successful, output = self.handle_command(command, args)
-            print(successful, output)
-            if self.verbose or not successful:
-                print(output, end='\n' if output != '' else '')
+            # print(successful, output)
+            print(output, end='\n' if output != '' else '')
+            # if self.verbose or not successful:
+            #     print(output, end='\n' if output != '' else '')
     
     def handle_command(self, command, args):
         match command:
@@ -90,14 +87,13 @@ class Client:
                 path = self.parse_args(args, 'usage: open [path to file]', None)
                 if path is False:
                     return False, 'invalid path'
-                path, _, dirname = path.rpartition('/')
 
                 # get storage server to connect to from name server
                 # vim interface
                 # - allows you to read/edit file
                 # - can save changes, pass them along to storage servers
 
-                return True, ''
+                return self.open(path)
             
             case 'clear':
                 os.system('clear')
@@ -129,9 +125,9 @@ class Client:
                 reply = self.rpc(message)
                 return True, ''
 
-            case 'restart':
+            case 'servers':
                 message = {
-                    'method': 'restart'
+                    'method': 'servers'
                 }
 
                 reply = self.rpc(message)
@@ -231,6 +227,21 @@ class Client:
             return False, reply['result']
         
         return True, f'removed directory {dirname}'
+
+    def open(self, path):
+        message = {
+            'method': 'open',
+            'path': path,
+        }
+
+        reply = self.rpc(message)
+
+        if reply['result'] != 'success':
+            return False, reply['result']
+
+        print(reply['return'])
+        
+        return True, f'opened file {path}'
 
     def connect(self, hostname, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -388,7 +399,7 @@ class Client:
                     if not self.valid_filename(l):
                         return False
                     resolved_levels.append(l)
-        print(resolved_levels)
+        # print(resolved_levels)
         return '/'.join(resolved_levels)
 
     def valid_filename(self, filename):

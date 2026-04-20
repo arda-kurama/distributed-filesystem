@@ -14,17 +14,33 @@ from collections import defaultdict
 BUFSIZE = 4096
 HEADER_LEN = 4
 REGISTER_UPDATE_PERIOD = 60
+HEARTBEAT_TIMEOUT = 60
 
+# metadata for files stored in NameServer paths
 class FileData:
-    def __init__(self, id, size, checksum, server_num):
+    def __init__(self, id, path, owner, servers, permissions, lock_owner=None, lock_expire=None):
         self.id = id
-        self.size = size
-        self.checksum = checksum
-        self.storage_server = server_num
+        self.path = path
+        self.owner = owner # username of who created file
+        self.servers = servers # list of storage server id's
+        self.permissions = permissions # who is allowed to edit ('owner', 'all')
+        self.lock_owner = lock_owner # who is currently editing
+        self.lock_expire = lock_expire
+
+# metadata for storage servers registered in NameServer storage_servers
+class StorageServerInfo:
+    def __init__(self, id, host, port, files, last_heartbeat=0, alive=False):
+        self.id = id
+        self.host = host
+        self.port = port
+        self.files = files # list of file id's it has stored
+        self.last_heartbeat = last_heartbeat
+        self.alive = alive
 
 class NameServer():
     def __init__(self, project_name):
         self.project_name = project_name
+        self.server_name = f'{self.project_name}-NS'
         self.paths = dict() # path -> FileData()
         self.dir_tree = defaultdict(lambda: {
             'dirs': set(),
@@ -46,10 +62,12 @@ class NameServer():
         #     },
         # }
 
-        self.storage_servers = [None]
+        self.storage_servers = {} # server_id -> StorageServerInfo
 
         # initialize files and directories using checkpoint and log files
         self.playback()
+        self.next_storage_server_id = max(info.id for info in self.storage_servers.values()) + 1 if self.storage_servers else 1
+        print(f'next_id: {self.next_storage_server_id}')
 
         # create socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -75,13 +93,13 @@ class NameServer():
         self.client_bytes = dict()
     
     def playback(self):
-        self.checkpoint = f'{self.project_name}/table.ckpt'
-        self.log = f'{self.project_name}/table.txn'
+        self.checkpoint = f'{self.server_name}/table.ckpt'
+        self.log = f'{self.server_name}/table.txn'
         self.log_entries = 0
 
         # fresh start
-        if not os.path.exists(f'{self.project_name}'):
-            os.mkdir(f'{self.project_name}')
+        if not os.path.exists(f'{self.server_name}'):
+            os.mkdir(f'{self.server_name}')
 
             if not os.path.exists(self.log) or not os.path.exists(self.checkpoint):
                 # create relevant files if they dont exist
@@ -98,19 +116,28 @@ class NameServer():
             with open(self.checkpoint, 'r') as f:
                 ckpt = json.load(f)
                 ckpt_paths = ckpt['paths']
-                ckpt_dir_tree = ckpt['dir_tree']
                 for path, meta in ckpt_paths.items():
                     self.paths[path] = FileData(
                         id=meta['id'],
-                        size=meta['size'],
-                        checksum=meta['checksum'],
-                        server_num=meta['storage_server']
+                        path=meta['path'],
+                        owner=meta['owner'],
+                        servers=meta['servers'],
+                        permissions=meta['permissions']
                     )
+                ckpt_dir_tree = ckpt['dir_tree']
                 for dir, entry in ckpt_dir_tree.items():
                     self.dir_tree[dir] = {
                         'dirs': set(entry.get('dirs', [])),
                         'files': set(entry.get('files', []))
                     }
+                ckpt_storage_servers = ckpt['servers']
+                for id, entry in ckpt_storage_servers.items():
+                    self.storage_servers[id] = StorageServerInfo(
+                        id=entry['id'],
+                        host=entry['host'],
+                        port=entry['port'],
+                        files=entry['files']
+                    )
         except json.JSONDecodeError:
             # empty checkpoint file
             pass
@@ -126,26 +153,35 @@ class NameServer():
                     operation = json.loads(line)
                     self.log_entries += 1
 
-                    parent_dir, _, name = operation['path'].rpartition('/')
                     if operation['operation'] == 'create':
+                        parent_dir, _, name = operation['path'].rpartition('/')
                         if operation['type'] == 'file':
                             self.paths[operation['path']] = FileData(
                                 id=operation['id'],
-                                size=operation['size'],
-                                checksum=operation['checksum'],
-                                server_num=operation['storage_server']
+                                path=operation['path'],
+                                owner=operation['owner'],
+                                servers=operation['servers'],
+                                permissions=operation['permissions']
                             )
                             self.dir_tree[parent_dir]['files'].add(name)
                         else:
                             self.dir_tree[operation['path']]
                             self.dir_tree[parent_dir]['dirs'].add(name)
                     if operation['operation'] == 'remove':
+                        parent_dir, _, name = operation['path'].rpartition('/')
                         if operation['type'] == 'file':
                             self.paths.pop(operation['path'])
                             self.dir_tree[parent_dir]['files'].remove(name)
                         else:
                             self.dir_tree.pop(operation['path'])
                             self.dir_tree[parent_dir]['dirs'].remove(name)
+                    if operation['operation'] == 'register':
+                        self.storage_servers[operation['id']] = StorageServerInfo(
+                            id=operation['id'],
+                            host=operation['host'],
+                            port=operation['port'],
+                            files=operation['files']
+                        )
                     
         except json.JSONDecodeError:
             # empty log file
@@ -155,20 +191,30 @@ class NameServer():
         checkpoint_data = {
             'paths': {},
             'dir_tree': {},
+            'servers': {}
         }
 
         for path, meta in self.paths.items():
             checkpoint_data['paths'][path] = {
                 'id': meta.id,
-                'size': meta.size,
-                'checksum': meta.checksum,
-                'storage_server': meta.storage_server
+                'path': meta.path,
+                'owner': meta.owner,
+                'servers': meta.servers,
+                'permissions': meta.permissions
             }
         
         for dir, entry in self.dir_tree.items():
             checkpoint_data['dir_tree'][dir] = {
                 'dirs': sorted(entry['dirs']),
                 'files': sorted(entry['files'])
+            }
+        
+        for id, entry in self.storage_servers.items():
+            checkpoint_data['servers'][id] = {
+                'id': entry.id,
+                'host': entry.host,
+                'port': entry.port,
+                'files': entry.files
             }
 
         # write current data to new checkpoint
@@ -208,6 +254,7 @@ class NameServer():
     
     def handle_events(self, events):
         for fd, event in events:
+            # print(fd, event)
             if fd == self.server_socket.fileno(): # new connection
                 self.connection_event()
             elif event & select.EPOLLIN: # socket readable
@@ -220,7 +267,7 @@ class NameServer():
             client_socket, _ = self.server_socket.accept()
             client_socket.setblocking(False)
         except (BlockingIOError, OSError):
-            pass
+            return
 
         fd = client_socket.fileno()
         self.epoll.register(fd, select.EPOLLIN)
@@ -312,6 +359,7 @@ class NameServer():
         self.server_socket.close()
         self.udp_sock.close()
 
+    # general rpc handler
     def response(self, message):
         rpc = json.loads(message.decode('utf-8'))
 
@@ -319,7 +367,7 @@ class NameServer():
         if 'method' not in rpc:
             return self.make_reply('invalid message, no method provided')
         
-        # perform method
+        # client methods
         if rpc['method'] == 'ls':
             return self.ls(rpc.get('path'))
         if rpc['method'] == 'cd':
@@ -332,6 +380,16 @@ class NameServer():
             return self.mkdir(rpc.get('path'), rpc.get('dirname'))
         if rpc['method'] == 'rmdir':
             return self.rmdir(rpc.get('path'), rpc.get('dirname'))
+        if rpc['method'] == 'open':
+            return self.open(rpc.get('path'))
+        
+        # storage server methods
+        if rpc['method'] == 'register':
+            return self.register_storage_server(rpc.get('id'), rpc.get('host'), rpc.get('port'))
+        if rpc['method'] == 'heartbeat':
+            info = self.storage_servers[rpc.get('id')]
+            info.last_heartbeat = time.time()
+            info.alive = True
 
         # more methods to test out server functionality
         if rpc['method'] == 'compact':
@@ -343,10 +401,14 @@ class NameServer():
         if rpc['method'] == 'tree':
             self.print_tree()
             return self.make_reply('success')
+        if rpc['method'] == 'servers':
+            print(self.storage_servers)
+            return self.make_reply('success')
         
         # method not found
         return self.make_reply('invalid method')
 
+    # individual rpc stubs
     def ls(self, client_path):
         # check that parameters exist
         if client_path is None:
@@ -378,16 +440,28 @@ class NameServer():
         # crash safe ordering
         path = self.child_path(client_path, filename)
         file_id = uuid.uuid4().hex
-        storage_server = hash(path) % len(self.storage_servers)
+
+        storage_server = self.choose_storage_server(path)
+        if storage_server is None:
+            return self.make_reply('no storage servers available')
+        
+        reply = self.rpc_storage_server(storage_server, {
+            'method': 'create',
+            'id': file_id,
+            'path': path,
+        })
+
+        if reply['result'] != 'success':
+            return self.make_reply(f'storage create failed: {reply['result']}')
         
         # 1. update log file
         operation = {'operation': 'create',
                         'type': 'file',
                         'id': file_id,
                         'path': path,
-                        'size': 0,
-                        'checksum': None,
-                        'storage_server': storage_server}
+                        'owner': None,
+                        'servers': [storage_server],
+                        'permissions': 'owner'}
         with open(self.log, 'a') as f:
             f.write(json.dumps(operation) + '\n')
 
@@ -396,7 +470,7 @@ class NameServer():
         self.log_entries += 1
         
         # 2. add metadata to hash table in memory
-        self.paths[path] = FileData(file_id, 0, None, storage_server)
+        self.paths[path] = FileData(file_id, path, None, [storage_server], 'owner')
         self.dir_tree[client_path]['files'].add(filename)
 
         return self.make_reply('success')
@@ -495,11 +569,6 @@ class NameServer():
             os.fsync(f.fileno())
         self.log_entries += len(recursive_files) + len(recursive_dirs)
 
-        print(recursive_files)
-        print(recursive_dirs)
-
-        # return self.make_reply('success')
-        
         # remove from memory
         for path in recursive_files:
             parent_dir, _, filename = path.rpartition('/')
@@ -512,6 +581,27 @@ class NameServer():
         
         return self.make_reply('success')
 
+    def open(self, path):
+        if path is None:
+            return self.make_reply('invalid arguments for open')
+
+        if path not in self.paths:
+            return self.make_reply('file not found')
+
+        meta = self.paths[path]
+        servers = meta.servers
+        server_id = servers[0]
+        if server_id not in self.storage_servers:
+            return self.make_reply('storage server unavailable')
+
+        ss = self.storage_servers[server_id]
+        return self.make_reply('success', {
+            'file_id': meta.id,
+            'storage_server_id': ss.id,
+            'host': ss.host,
+            'port': ss.port
+        })
+
     def child_path(self, parent_dir, name):
         return f'{parent_dir}/{name}'
 
@@ -521,11 +611,99 @@ class NameServer():
     def make_reply(self, result, value=None):
         return json.dumps({'result': result, 'return': value}).encode('utf-8')
 
+    # storage server methods
+    def register_storage_server(self, server_id, host, port):
+        if host is None or port is None:
+            return self.make_reply('invalid arguments for register')
+        
+        if server_id is None:
+            server_id = self.next_storage_server_id
+            self.next_storage_server_id += 1
+        
+            # write to log file
+            operation = {'operation': 'register',
+                        'id': server_id,
+                        'host': host,
+                        'port': port,
+                        'files': []}
+            with open(self.log, 'a') as f:
+                f.write(json.dumps(operation) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            self.log_entries += 1
+
+            self.storage_servers[server_id] = StorageServerInfo(
+                id=server_id,
+                host=host,
+                port=port,
+                last_heartbeat=time.time(),
+                alive=True,
+                files=[]
+            )
+
+            print(f'registered storage server {server_id} at {host}:{port}')
+        else:
+            info = self.storage_servers[server_id]
+            info.last_heartbeat = time.time()
+            info.alive = True
+
+        return self.make_reply('success', server_id)
+
+    def rpc_storage_server(self, server_id, message):
+        if server_id not in self.storage_servers:
+            raise RuntimeError(f'unknown storage server {server_id}')
+
+        info = self.storage_servers[server_id]
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((info.host, info.port))
+
+        try:
+            message_bytes = json.dumps(message).encode('utf-8')
+            header = struct.pack('!I', len(message_bytes))
+            sock.sendall(header + message_bytes)
+
+            header = self.recv_exact(sock, HEADER_LEN)
+            length = struct.unpack('!I', header)[0]
+            reply_bytes = self.recv_exact(sock, length)
+            return json.loads(reply_bytes.decode('utf-8'))
+        finally:
+            sock.close()
+
+    def recv_exact(self, sock, n):
+        chunks = []
+        got = 0
+        while got < n:
+            chunk = sock.recv(n - got)
+            if chunk == b'':
+                raise RuntimeError('socket closed')
+            chunks.append(chunk)
+            got += len(chunk)
+        return b''.join(chunks)
+
+    def choose_storage_server(self, path):
+        if not self.storage_servers:
+            return None
+
+        live_ids = sorted(id for id, info in self.storage_servers.items() if info.alive)
+        if not live_ids:
+            return None
+        return live_ids[hash(path) % len(live_ids)]
+
+    def reap_storage_servers(self):
+        now = time.time()
+        for info in self.storage_servers.values():
+            if now - info.last_heartbeat > HEARTBEAT_TIMEOUT:
+                info.alive = False
+
     def run(self):
         threading.Thread(target=self.update_register, daemon=True).start()
 
         try:
             while True:
+                # check if storage servers are still up
+                self.reap_storage_servers()
 
                 # update checkpoint file if needed
                 if self.log_entries > 100:
