@@ -6,6 +6,9 @@ import http.client
 import time
 import os
 import re
+import subprocess
+import tempfile
+import base64
 
 from NameServer import NameServer
 
@@ -87,13 +90,13 @@ class Client:
                 path = self.parse_args(args, 'usage: open [path to file]', None)
                 if path is False:
                     return False, 'invalid path'
-
-                # get storage server to connect to from name server
-                # vim interface
-                # - allows you to read/edit file
-                # - can save changes, pass them along to storage servers
-
                 return self.open(path)
+
+            case 'vim':
+                path = self.parse_args(args, 'usage: vim [path to file]', None)
+                if path is False:
+                    return False, 'invalid path'
+                return self.vim(path)
             
             case 'clear':
                 os.system('clear')
@@ -146,7 +149,7 @@ class Client:
         reply = self.rpc(message)
 
         if reply['result'] != 'success':
-            return False, f'ls error: {reply['result']}'
+            return False, f"ls error: {reply['result']}"
         else:
             dirs, files = reply['return']
 
@@ -239,9 +242,67 @@ class Client:
         if reply['result'] != 'success':
             return False, reply['result']
 
-        print(reply['return'])
-        
-        return True, f'opened file {path}'
+        return True, reply['return']
+
+    def vim(self, path):
+        ok, open_result = self.open(path)
+        if not ok:
+            if open_result != 'file not found':
+                return False, open_result
+
+            parent, _, filename = path.rpartition('/')
+            ok, create_result = self.create(parent, filename)
+            if not ok:
+                return False, f'create failed: {create_result}'
+
+            ok, open_result = self.open(path)
+            if not ok:
+                return False, open_result
+
+        file_id = open_result['file_id']
+        host = open_result['host']
+        port = open_result['port']
+
+        read_reply = self.rpc_storage_server(host, port, {
+            'method': 'read',
+            'id': file_id,
+        })
+        if read_reply['result'] != 'success':
+            return False, f"read failed: {read_reply['result']}"
+
+        encoded = read_reply['return']['contents']
+        raw = base64.b64decode(encoded.encode('utf-8'))
+
+        temp_path = None
+        suffix = ''
+        _, _, filename = path.rpartition('/')
+        if '.' in filename:
+            suffix = '.' + filename.split('.')[-1]
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                temp_path = tmp.name
+                tmp.write(raw)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+
+            subprocess.run(['vim', temp_path], check=False)
+
+            with open(temp_path, 'rb') as f:
+                new_raw = f.read()
+
+            write_reply = self.rpc_storage_server(host, port, {
+                'method': 'write',
+                'id': file_id,
+                'contents': base64.b64encode(new_raw).decode('utf-8'),
+            })
+            if write_reply['result'] != 'success':
+                return False, f"write failed: {write_reply['result']}"
+
+            return True, f'edited file: {path}'
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def connect(self, hostname, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -299,6 +360,35 @@ class Client:
         header = self.recv(HEADER_LEN)
         message_length = struct.unpack('!I', header)[0]
         return self.recv(message_length)
+
+    def recv_exact(self, sock, length):
+        chunks = []
+        bytes_received = 0
+        while bytes_received < length:
+            chunk = sock.recv(length - bytes_received)
+            if chunk == b'':
+                raise RuntimeError('Socket connection broken (recv_exact)')
+            chunks.append(chunk)
+            bytes_received += len(chunk)
+        return b''.join(chunks)
+
+    def rpc_storage_server(self, host, port, message):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+
+        try:
+            sock.connect((host, port))
+
+            message_bytes = json.dumps(message).encode('utf-8')
+            header = struct.pack('!I', len(message_bytes))
+            sock.sendall(header + message_bytes)
+
+            header = self.recv_exact(sock, HEADER_LEN)
+            length = struct.unpack('!I', header)[0]
+            reply_bytes = self.recv_exact(sock, length)
+            return json.loads(reply_bytes.decode('utf-8'))
+        finally:
+            sock.close()
 
     def rpc(self, message):
         self.sock = None

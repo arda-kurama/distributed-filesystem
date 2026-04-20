@@ -452,7 +452,7 @@ class NameServer():
         })
 
         if reply['result'] != 'success':
-            return self.make_reply(f'storage create failed: {reply['result']}')
+            return self.make_reply(f"storage create failed: {reply['result']}")
         
         # 1. update log file
         operation = {'operation': 'create',

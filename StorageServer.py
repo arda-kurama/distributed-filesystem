@@ -8,6 +8,8 @@ import os
 import re
 import threading
 import select
+import base64
+import hashlib
 
 from NameServer import NameServer
 
@@ -271,8 +273,11 @@ class StorageServer:
                     if operation['method'] == 'remove':
                         self.files.pop(operation['id'])
                     if operation['method'] == 'write':
-                        # write, file, position, data
-                        pass
+                        if operation['id'] in self.files:
+                            meta = self.files[operation['id']]
+                            meta.size = operation['size']
+                            meta.checksum = operation['checksum']
+                            meta.modified = operation['modified']
                     if operation['method'] == 'delete':
                         # delete, file, position, length
                         pass
@@ -440,6 +445,10 @@ class StorageServer:
             return self.remove(rpc.get('id'))
         if rpc['method'] == 'stat':
             return self.stat(rpc.get('id'))
+        if rpc['method'] == 'read':
+            return self.read(rpc.get('id'))
+        if rpc['method'] == 'write':
+            return self.write(rpc.get('id'), rpc.get('contents'))
         
         # method not found
         return self.make_reply('invalid method')
@@ -519,6 +528,61 @@ class StorageServer:
             'checksum': meta.checksum,
             'modified': meta.modified
         })
+
+    def read(self, file_id):
+        if file_id is None or file_id not in self.files:
+            return self.make_reply('file not found')
+
+        meta = self.files[file_id]
+        with open(meta.stored_path, 'rb') as f:
+            raw = f.read()
+
+        encoded = base64.b64encode(raw).decode('utf-8')
+        return self.make_reply('success', {
+            'contents': encoded,
+            'size': meta.size,
+            'checksum': meta.checksum,
+            'modified': meta.modified,
+        })
+
+    def write(self, file_id, contents):
+        if file_id is None or file_id not in self.files or contents is None:
+            return self.make_reply('invalid arguments for write')
+
+        try:
+            raw = base64.b64decode(contents.encode('utf-8'))
+        except Exception:
+            return self.make_reply('invalid contents')
+
+        meta = self.files[file_id]
+        modified = time.time()
+        checksum = hashlib.sha256(raw).hexdigest()
+        size = len(raw)
+
+        operation = {
+            'method': 'write',
+            'id': file_id,
+            'size': size,
+            'checksum': checksum,
+            'modified': modified,
+        }
+
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        self.log_entries += 1
+
+        with open(meta.stored_path, 'wb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+
+        meta.size = size
+        meta.checksum = checksum
+        meta.modified = modified
+
+        return self.make_reply('success')
 
     def make_reply(self, result, value=None):
         return json.dumps({'result': result, 'return': value}).encode('utf-8')
