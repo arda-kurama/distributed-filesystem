@@ -7,17 +7,22 @@ import uuid
 import threading
 import time
 import select
-import signal
 import hashlib
-import random
 from collections import defaultdict
 
+# server specific
 BUFSIZE = 4096
-HEADER_LEN = 4
 REGISTER_UPDATE_PERIOD = 60
-HEARTBEAT_TIMEOUT = 60
+
+# shared with client
 REPLICA_COUNT = 3
 LOCK_LEASE = 60
+
+# shared with storage server
+HEARTBEAT_TIMEOUT = 60
+
+# shared with both
+HEADER_LEN = 4
 
 # metadata for files stored in NameServer paths
 class FileData:
@@ -50,20 +55,22 @@ class NameServer():
             'files': set(),
         })
         # example structure:
-        # dir_tree = {
-        #     '/': {
-        #         'dirs': {'docs', 'tmp'},
-        #         'files': set(),
-        #     },
-        #     '/docs': {
-        #         'dirs': set(),
-        #         'files': {'report.txt', 'notes.txt'},
-        #     },
-        #     '/tmp': {
-        #         'dirs': set(),
-        #         'files': set(),
-        #     },
-        # }
+        {
+            # dir_tree = {
+            #     '/': {
+            #         'dirs': {'docs', 'tmp'},
+            #         'files': set(),
+            #     },
+            #     '/docs': {
+            #         'dirs': set(),
+            #         'files': {'report.txt', 'notes.txt'},
+            #     },
+            #     '/tmp': {
+            #         'dirs': set(),
+            #         'files': set(),
+            #     },
+            # }
+        }
 
         self.storage_servers = {} # server_id -> StorageServerInfo
 
@@ -95,6 +102,7 @@ class NameServer():
         self.client_msglens = dict()
         self.client_bytes = dict()
     
+    # use checkpoint and log files to refresh memory
     def playback(self):
         self.checkpoint = f'{self.server_name}/table.ckpt'
         self.log = f'{self.server_name}/table.txn'
@@ -192,6 +200,7 @@ class NameServer():
             # empty log file
             pass
     
+    # update checkpoint and clear log
     def compact(self):
         checkpoint_data = {
             'paths': {},
@@ -238,6 +247,7 @@ class NameServer():
         with open(self.log, 'a') as _:
             pass
     
+    # register on catalog server so client can discover
     def register(self):
         message = {
             'type': 'name_server',
@@ -257,6 +267,7 @@ class NameServer():
             time.sleep(REGISTER_UPDATE_PERIOD)
             self.register()
     
+    # event driven server methods
     def handle_events(self, events):
         for fd, event in events:
             # print(fd, event)
@@ -359,6 +370,7 @@ class NameServer():
             del self.client_msglens[fd]
             del self.client_bytes[fd]
     
+    # clean up server on close
     def close(self):
         self.epoll.close()
         self.server_socket.close()
@@ -451,7 +463,6 @@ class NameServer():
         if filename in self.dir_tree[client_path]['files']:
             return self.make_reply('success')
 
-        # crash safe ordering
         path = self.child_path(client_path, filename)
         file_id = uuid.uuid4().hex
 
@@ -476,6 +487,7 @@ class NameServer():
         if not created_on:
             return self.make_reply('file not created on any storage servers')
         
+        # crash safe ordering
         # 1. update log file
         operation = {'operation': 'create',
                         'type': 'file',
@@ -659,7 +671,6 @@ class NameServer():
         
         return self.make_reply('success')
 
-    # return where replicas are located
     def open_for_read(self, path):
         if path is None:
             return self.make_reply('invalid arguments for open')
@@ -749,6 +760,7 @@ class NameServer():
         meta.lock_expire = 0
         return self.make_reply('success')
 
+    # helper methods
     def delete_file_replicas(self, path):
         meta = self.paths[path]
         failed = []

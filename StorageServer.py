@@ -5,16 +5,14 @@ import json
 import http.client
 import time
 import os
-import re
 import threading
 import select
 import base64
 import hashlib
 
-from NameServer import NameServer
-
+# shared with name server
 HEADER_LEN = 4
-HEARTRATE = 30
+HEARTBEAT_TIMEOUT = 60
 BUFSIZE = 4096
 
 class StoredFile:
@@ -66,6 +64,7 @@ class StorageServer:
         self.client_msglens = dict()
         self.client_bytes = dict()
     
+    # methods to restore name server registry
     def load_identity(self):
         if os.path.exists(self.identity_file):
             with open(self.identity_file, 'r') as f:
@@ -77,113 +76,6 @@ class StorageServer:
             json.dump(identity, f)
             f.flush()
             os.fsync(f.fileno())
-    
-    def connect(self, hostname, port):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((hostname, port))
-
-        if self.verbose:
-            print(f'Connected to {hostname} on port {port}')
-    
-    def lookup_server_name(self):
-        conn = http.client.HTTPConnection('catalog.cse.nd.edu', 9097)
-        conn.request('GET', '/query.json')
-        response = conn.getresponse()
-        data = response.read().decode('utf-8')
-
-        entries = json.loads(data)
-        server = None
-        time = 0
-        for entry in entries:
-            if entry.get('type') == 'name_server' and entry.get('project') == self.project_name:
-                if entry['lastheardfrom'] > time:
-                    server = entry
-                    time = entry['lastheardfrom']
-
-        if not server:
-            raise RuntimeError(f'Error: no name server found with name \'{self.project_name}\'')
-        
-        return (server['name'], server['port'])
-    
-    def send_message(self, message):
-        header = struct.pack('!I', len(message))
-        message = header + message
-        message_length = len(message)
-        
-        bytes_sent = 0
-        while bytes_sent < message_length:
-            sent = self.sock.send(message[bytes_sent:])
-
-            if sent == 0:
-                raise RuntimeError('Socket connection broken (send)')
-            bytes_sent += sent
-    
-    def recv(self, length):
-        chunks = []
-        bytes_recieved = 0
-        while bytes_recieved < length:
-            chunk = self.sock.recv(length - bytes_recieved)
-            
-            if chunk == b'':
-                raise RuntimeError('Socket connection broken (recv)')
-            chunks.append(chunk)
-            bytes_recieved += len(chunk)
-        return b''.join(chunks)
-    
-    def recv_message(self):
-        header = self.recv(HEADER_LEN)
-        message_length = struct.unpack('!I', header)[0]
-        return self.recv(message_length)
-
-    def rpc(self, message):
-        self.sock = None
-        reply = None
-        attempts = 0
-
-        while not reply:
-            try:
-                # lookup
-                if self.very_verbose:
-                    print('Looking up name...')
-                hostname, port = self.lookup_server_name()
-                
-                # connect
-                if self.very_verbose:
-                    print('Connecting to server...')
-                self.connect(hostname, port)
-                self.sock.settimeout(5.0)
-        
-                # send
-                if self.very_verbose:
-                    print('Sending message...')
-                message_bytes = json.dumps(message).encode('utf-8')
-                self.send_message(message_bytes)
-                # if self.verbose:
-                #     print(f'Sent: {message}')
-
-                # recv
-                if self.very_verbose:
-                    print('Receiving response...')
-                reply_bytes = self.recv_message()
-                reply = json.loads(reply_bytes.decode('utf-8'))
-                # if self.verbose:
-                #     print(f'Recv: {reply}')
-                
-                # close
-                self.sock.close()
-            
-            except Exception as e:
-                if self.sock:
-                    self.sock.close()
-
-                if self.verbose:
-                    print(f'Error: {e}')
-                    print(f'{2 ** attempts} second timeout...')
-                
-                time.sleep(2 ** attempts)
-                attempts += 1
-
-        return reply
     
     def register(self):
         message = {
@@ -208,9 +100,10 @@ class StorageServer:
         }
         # periodically let name server know we're still here
         while True:
-            time.sleep(HEARTRATE)
+            time.sleep(HEARTBEAT_TIMEOUT / 2)
             self.rpc(message)
-    
+
+    # checkpoint and log methods
     def playback(self):
         self.data_dir = f'{self.server_name}/data'
         self.checkpoint = f'{self.server_name}/table.ckpt'
@@ -324,7 +217,116 @@ class StorageServer:
             path = os.path.join(self.data_dir, name)
             if path not in active_files:
                 os.remove(path)
+   
+    # rpc for communicating with name server
+    def rpc(self, message):
+        self.sock = None
+        reply = None
+        attempts = 0
+
+        while not reply:
+            try:
+                # lookup
+                if self.very_verbose:
+                    print('Looking up name...')
+                hostname, port = self.lookup_server_name()
+                
+                # connect
+                if self.very_verbose:
+                    print('Connecting to server...')
+                self.connect(hostname, port)
+                self.sock.settimeout(5.0)
+        
+                # send
+                if self.very_verbose:
+                    print('Sending message...')
+                message_bytes = json.dumps(message).encode('utf-8')
+                self.send_message(message_bytes)
+                # if self.verbose:
+                #     print(f'Sent: {message}')
+
+                # recv
+                if self.very_verbose:
+                    print('Receiving response...')
+                reply_bytes = self.recv_message()
+                reply = json.loads(reply_bytes.decode('utf-8'))
+                # if self.verbose:
+                #     print(f'Recv: {reply}')
+                
+                # close
+                self.sock.close()
+            
+            except Exception as e:
+                if self.sock:
+                    self.sock.close()
+
+                if self.verbose:
+                    print(f'Error: {e}')
+                    print(f'{2 ** attempts} second timeout...')
+                
+                time.sleep(2 ** attempts)
+                attempts += 1
+
+        return reply
+
+    def connect(self, hostname, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((hostname, port))
+
+        if self.verbose:
+            print(f'Connected to {hostname} on port {port}')
     
+    def lookup_server_name(self):
+        conn = http.client.HTTPConnection('catalog.cse.nd.edu', 9097)
+        conn.request('GET', '/query.json')
+        response = conn.getresponse()
+        data = response.read().decode('utf-8')
+
+        entries = json.loads(data)
+        server = None
+        time = 0
+        for entry in entries:
+            if entry.get('type') == 'name_server' and entry.get('project') == self.project_name:
+                if entry['lastheardfrom'] > time:
+                    server = entry
+                    time = entry['lastheardfrom']
+
+        if not server:
+            raise RuntimeError(f'Error: no name server found with name \'{self.project_name}\'')
+        
+        return (server['name'], server['port'])
+    
+    def send_message(self, message):
+        header = struct.pack('!I', len(message))
+        message = header + message
+        message_length = len(message)
+        
+        bytes_sent = 0
+        while bytes_sent < message_length:
+            sent = self.sock.send(message[bytes_sent:])
+
+            if sent == 0:
+                raise RuntimeError('Socket connection broken (send)')
+            bytes_sent += sent
+    
+    def recv(self, length):
+        chunks = []
+        bytes_recieved = 0
+        while bytes_recieved < length:
+            chunk = self.sock.recv(length - bytes_recieved)
+            
+            if chunk == b'':
+                raise RuntimeError('Socket connection broken (recv)')
+            chunks.append(chunk)
+            bytes_recieved += len(chunk)
+        return b''.join(chunks)
+    
+    def recv_message(self):
+        header = self.recv(HEADER_LEN)
+        message_length = struct.unpack('!I', header)[0]
+        return self.recv(message_length)
+
+    # event driven server methods
     def handle_events(self, events):
         for fd, event in events:
             # print(fd, event)
@@ -427,10 +429,12 @@ class StorageServer:
             del self.client_msglens[fd]
             del self.client_bytes[fd]
     
+    # cleanup server on close
     def close(self):
         self.epoll.close()
         self.server_socket.close()
 
+    # handles rpc with client
     def response(self, message):
         rpc = json.loads(message.decode('utf-8'))
 
@@ -453,6 +457,7 @@ class StorageServer:
         # method not found
         return self.make_reply('invalid method')
 
+    # server stubs for rpc with client
     def create(self, file_id, path):
         if file_id is None or path is None:
             return self.make_reply('invalid arguments for create')
@@ -516,19 +521,6 @@ class StorageServer:
         self.files.pop(file_id)
         return self.make_reply('success')
 
-    def stat(self, file_id):
-        if file_id is None or file_id not in self.files:
-            return self.make_reply(f'file id {file_id} found')
-
-        meta = self.files[file_id]
-        return self.make_reply('success', {
-            'id': meta.id,
-            'stored_path': meta.stored_path,
-            'size': meta.size,
-            'checksum': meta.checksum,
-            'modified': meta.modified
-        })
-
     def read(self, file_id):
         if file_id is None or file_id not in self.files:
             return self.make_reply('file not found')
@@ -584,6 +576,7 @@ class StorageServer:
 
         return self.make_reply('success')
 
+    # helper to return json reply
     def make_reply(self, result, value=None):
         return json.dumps({'result': result, 'return': value}).encode('utf-8')
 
