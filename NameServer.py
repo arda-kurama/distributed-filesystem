@@ -9,6 +9,7 @@ import time
 import select
 import signal
 import hashlib
+import random
 from collections import defaultdict
 
 BUFSIZE = 4096
@@ -16,10 +17,11 @@ HEADER_LEN = 4
 REGISTER_UPDATE_PERIOD = 60
 HEARTBEAT_TIMEOUT = 60
 REPLICA_COUNT = 3
+LOCK_LEASE = 60
 
 # metadata for files stored in NameServer paths
 class FileData:
-    def __init__(self, id, path, owner, servers, permissions, lock_owner=None, lock_expire=None):
+    def __init__(self, id, path, owner, servers, permissions, lock_owner=None, lock_expire=0):
         self.id = id
         self.path = path
         self.owner = owner # username of who created file
@@ -183,6 +185,8 @@ class NameServer():
                             port=operation['port'],
                             files=operation['files']
                         )
+                    if operation['operation'] == 'chmod':
+                        self.paths[operation['path']].permissions = operation['permissions']
                     
         except json.JSONDecodeError:
             # empty log file
@@ -374,15 +378,23 @@ class NameServer():
         if rpc['method'] == 'cd':
             return self.cd(rpc.get('path'))
         if rpc['method'] == 'create':
-            return self.create(rpc.get('path'), rpc.get('filename'))
+            return self.create(rpc.get('user'), rpc.get('path'), rpc.get('filename'))
+        if rpc['method'] == 'chmod':
+            return self.chmod(rpc.get('user'), rpc.get('path'), rpc.get('filename'), rpc.get('permissions'))
         if rpc['method'] == 'remove':
-            return self.remove(rpc.get('path'), rpc.get('filename'))
+            return self.remove(rpc.get('user'), rpc.get('path'), rpc.get('filename'))
         if rpc['method'] == 'mkdir':
             return self.mkdir(rpc.get('path'), rpc.get('dirname'))
         if rpc['method'] == 'rmdir':
-            return self.rmdir(rpc.get('path'), rpc.get('dirname'))
-        if rpc['method'] == 'open':
-            return self.open(rpc.get('path'))
+            return self.rmdir(rpc.get('user'), rpc.get('path'), rpc.get('dirname'))
+        if rpc['method'] == 'open_for_read':
+            return self.open_for_read(rpc.get('path'))
+        if rpc['method'] == 'open_for_write':
+            return self.open_for_write(rpc.get('user'), rpc.get('path'))
+        if rpc['method'] == 'lock':
+            return self.lock(rpc.get('user'), rpc.get('path'))
+        if rpc['method'] == 'unlock':
+            return self.unlock(rpc.get('user'), rpc.get('path'))
         
         # storage server methods
         if rpc['method'] == 'register':
@@ -391,6 +403,7 @@ class NameServer():
             info = self.storage_servers[rpc.get('id')]
             info.last_heartbeat = time.time()
             info.alive = True
+            return self.make_reply('success')
 
         # more methods to test out server functionality
         if rpc['method'] == 'compact':
@@ -428,8 +441,8 @@ class NameServer():
         reply = {'result': 'success' if dest_dir in self.dir_tree else 'failure', 'return': dest_dir}
         return json.dumps(reply).encode('utf-8')
 
-    def create(self, client_path, filename):
-        if client_path is None or filename is None:
+    def create(self, user, client_path, filename):
+        if user is None or client_path is None or filename is None:
             return self.make_reply('invalid arguments for create')
 
         if filename in self.dir_tree[client_path]['dirs']:
@@ -468,7 +481,7 @@ class NameServer():
                         'type': 'file',
                         'id': file_id,
                         'path': path,
-                        'owner': None,
+                        'owner': user,
                         'servers': created_on,
                         'permissions': 'owner'}
         with open(self.log, 'a') as f:
@@ -479,13 +492,47 @@ class NameServer():
         self.log_entries += 1
         
         # 2. add metadata to hash table in memory
-        self.paths[path] = FileData(file_id, path, None, created_on, 'owner')
+        self.paths[path] = FileData(file_id, path, user, created_on, 'owner')
         self.dir_tree[client_path]['files'].add(filename)
 
         return self.make_reply('success')
 
-    def remove(self, client_path, filename):
-        if client_path is None or filename is None:
+    def chmod(self, user, client_path, filename, permissions):
+        if user is None or client_path is None or filename is None or permissions is None:
+            return self.make_reply('invalid arguments for chmod')
+
+        if filename in self.dir_tree[client_path]['dirs']:
+            return self.make_reply('cannot change permissions of directory')
+        
+        if permissions not in {'owner', 'all'}:
+            return self.make_reply('invalid permissions')
+        
+        path = self.child_path(client_path, filename)
+
+        meta = self.paths[path]
+        if meta.owner != user:
+            return self.make_reply('permission denied')
+        
+        if meta.permissions == permissions:
+            return self.make_reply('success')
+        
+        # update log file
+        operation = {'operation': 'chmod',
+                        'path': path,
+                        'permissions': permissions}
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
+
+            f.flush()
+            os.fsync(f.fileno())
+        self.log_entries += 1
+        
+        meta.permissions = permissions
+
+        return self.make_reply('success')
+
+    def remove(self, user, client_path, filename):
+        if user is None or client_path is None or filename is None:
             return self.make_reply('invalid arguments for remove')
         
         if filename in self.dir_tree[client_path]['dirs']:
@@ -496,6 +543,10 @@ class NameServer():
             return self.make_reply('success')
 
         path = self.child_path(client_path, filename)
+
+        meta = self.paths[path]
+        if meta.permissions == 'owner' and meta.owner != user:
+            return self.make_reply('permission denied')
 
         # tell storage servers to remove
         failed = self.delete_file_replicas(path)
@@ -542,8 +593,8 @@ class NameServer():
         
         return self.make_reply('success')
     
-    def rmdir(self, client_path, dirname):
-        if client_path is None or dirname is None:
+    def rmdir(self, user, client_path, dirname):
+        if user is None or client_path is None or dirname is None:
             return self.make_reply('invalid arguments for rmdir')
 
         if dirname in self.dir_tree[client_path]['files']:
@@ -557,23 +608,35 @@ class NameServer():
         recursive_dirs = []
         def walk(current_dir):
             for file in self.dir_tree[current_dir]['files']:
-                recursive_files.append(self.child_path(current_dir, file))
+                path = self.child_path(current_dir, file)
+                meta = self.paths[path]
+                if meta.permissions == 'owner' and meta.owner != user:
+                    return False, f'permission denied for {path}'
+                recursive_files.append(path)
             
             for dirname in self.dir_tree[current_dir]['dirs']:
                 dirpath = self.child_path(current_dir, dirname)
-                walk(dirpath)
+                success, result = walk(dirpath)
+                if not success:
+                    return success, result
             
             recursive_dirs.append(current_dir)
+            return True, ''
         
         dirpath = self.child_path(client_path, dirname)
-        walk(dirpath)
+        success, result = walk(dirpath)
+        if not success:
+            return self.make_reply(result)
+        
+        # remove replicas
+        for path in recursive_files:
+            failed = self.delete_file_replicas(path)
+            if failed:
+                return self.make_reply(f'remove failed on replicas: {failed}')
 
         # log all removes
         with open(self.log, 'a') as f:
             for path in recursive_files:
-                failed = self.delete_file_replicas(path)
-                if failed:
-                    return self.make_reply(f'remove failed on replicas: {failed}')
                 operation = {'operation': 'remove', 'type': 'file', 'path': path}
                 f.write(json.dumps(operation) + '\n')
             for path in recursive_dirs:
@@ -596,7 +659,8 @@ class NameServer():
         
         return self.make_reply('success')
 
-    def open(self, path):
+    # return where replicas are located
+    def open_for_read(self, path):
         if path is None:
             return self.make_reply('invalid arguments for open')
 
@@ -605,17 +669,85 @@ class NameServer():
 
         meta = self.paths[path]
         servers = meta.servers
-        server_id = servers[0]
-        if server_id not in self.storage_servers:
-            return self.make_reply('storage server unavailable')
+        replicas = []
+        for server_id in servers:
+            info = self.storage_servers[server_id] 
+            if info.alive:
+                replicas.append({'server_id': server_id, 'host': info.host, 'port': info.port})
+        
+        if not replicas:
+           return self.make_reply('file not available')
 
-        ss = self.storage_servers[server_id]
         return self.make_reply('success', {
             'file_id': meta.id,
-            'storage_server_id': ss.id,
-            'host': ss.host,
-            'port': ss.port
+            'replicas': replicas
         })
+
+    # checks permissions and lock
+    def open_for_write(self, user, path):
+        if user is None or path is None:
+            return self.make_reply('invalid arguments for open')
+
+        if path not in self.paths:
+            return self.make_reply('file not found')
+
+        meta = self.paths[path]
+        if meta.permissions == 'owner' and meta.owner != user:
+            return self.make_reply('permission denied')
+        
+        # have to get lock to edit file
+        lock_reply = json.loads(self.lock(user, path).decode('utf-8'))
+        if lock_reply['result'] != 'success':
+            return self.make_reply(f'could not obtain lock for {path}')
+        
+        servers = meta.servers
+        replicas = []
+        for server_id in servers:
+            info = self.storage_servers[server_id] 
+            if info.alive:
+                replicas.append({'server_id': server_id, 'host': info.host, 'port': info.port})
+        
+        if not replicas:
+           return self.make_reply('file not available')
+
+        return self.make_reply('success', {
+            'file_id': meta.id,
+            'replicas': replicas
+        })
+
+    def lock(self, user, path):
+        if user is None or path is None:
+            return self.make_reply('invalid arguments for open')
+
+        if path not in self.paths:
+            return self.make_reply('file not found')
+
+        meta = self.paths[path]
+        now = time.time()
+        # check if another user currently has lock
+        if meta.lock_owner != user and meta.lock_expire > now:
+            return self.make_reply(f'lock owned by {meta.lock_owner}, expires in {meta.lock_expire - now}')
+        
+        # otherwise, give lock to user for LOCK_LEASE seconds
+        meta.lock_owner = user
+        meta.lock_expire = now + LOCK_LEASE
+
+        return self.make_reply('success')
+    
+    def unlock(self, user, path):
+        if user is None or path is None:
+            return self.make_reply('invalid arguments for unlock')
+
+        if path not in self.paths:
+            return self.make_reply('file not found')
+
+        meta = self.paths[path]
+        if meta.lock_owner != user:
+            return self.make_reply('lock not owned by user')
+
+        meta.lock_owner = None
+        meta.lock_expire = 0
+        return self.make_reply('success')
 
     def delete_file_replicas(self, path):
         meta = self.paths[path]

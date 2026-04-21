@@ -9,10 +9,13 @@ import re
 import subprocess
 import tempfile
 import base64
+import random
+import threading
 
 from NameServer import NameServer
 
 HEADER_LEN = 4
+LOCK_LEASE = 60
 
 class Client:
     def __init__(self, username, project_name, verbose):
@@ -64,6 +67,16 @@ class Client:
                     return False, 'invalid path'
                 path, _, filename = path.rpartition('/')
                 return self.create(path, filename)
+            
+            case 'chmod':
+                if len(args) != 3:
+                    print('usage: chmod [path to file] [owner/all]')
+                    return False, ''
+                
+                path = self.resolve_path(args[1])
+                path, _, filename = path.rpartition('/')
+                permissions = args[2]
+                return self.chmod(path, filename, permissions)
             
             case 'remove':
                 path = self.parse_args(args, 'usage: remove [path to file]', None)
@@ -179,6 +192,7 @@ class Client:
     def create(self, path, filename):
         message = {
             'method': 'create',
+            'user': self.username,
             'path': path,
             'filename': filename
         }
@@ -190,9 +204,26 @@ class Client:
         
         return True, f'created file: {filename}'
 
+    def chmod(self, path, filename, permissions):
+        message = {
+            'method': 'chmod',
+            'user': self.username,
+            'path': path,
+            'filename': filename,
+            'permissions': permissions
+        }
+
+        reply = self.rpc(message)
+
+        if reply['result'] != 'success':
+            return False, reply['result']
+        
+        return True, f'changed permissions: {permissions}'
+
     def remove(self, path, filename):
         message = {
             'method': 'remove',
+            'user': self.username,
             'path': path,
             'filename': filename
         }
@@ -207,6 +238,7 @@ class Client:
     def mkdir(self, path, dirname):
         message = {
             'method': 'mkdir',
+            'user': self.username,
             'path': path,
             'dirname': dirname
         }
@@ -221,6 +253,7 @@ class Client:
     def rmdir(self, path, dirname):
         message = {
             'method': 'rmdir',
+            'user': self.username,
             'path': path,
             'dirname': dirname
         }
@@ -232,9 +265,9 @@ class Client:
         
         return True, f'removed directory {dirname}'
 
-    def open(self, path):
+    def open_for_read(self, path):
         message = {
-            'method': 'open',
+            'method': 'open_for_read',
             'path': path,
         }
 
@@ -245,42 +278,103 @@ class Client:
 
         return True, reply['return']
 
+    def open_for_write(self, path):
+        message = {
+            'method': 'open_for_write',
+            'user': self.username,
+            'path': path,
+        }
+
+        reply = self.rpc(message)
+
+        if reply['result'] != 'success':
+            return False, reply['result']
+
+        return True, reply['return']
+    
     def vim(self, path):
-        ok, open_result = self.open(path)
-        if not ok:
-            if open_result != 'file not found':
-                return False, open_result
+        success, replica_data = self.create_and_open(path)
+        if not success:
+            return False, replica_data
 
-            parent, _, filename = path.rpartition('/')
-            ok, create_result = self.create(parent, filename)
-            if not ok:
-                return False, f'create failed: {create_result}'
+        file_id = replica_data['file_id']
+        replicas = replica_data['replicas']
 
-            ok, open_result = self.open(path)
-            if not ok:
-                return False, open_result
+        # thread for lock renewal
+        stop_event = threading.Event()
+        renew_thread = threading.Thread(
+            target=self.renew_lock,
+            args=(path, stop_event),
+            daemon=True
+        )
+        renew_thread.start()
 
-        file_id = open_result['file_id']
-        host = open_result['host']
-        port = open_result['port']
-
-        read_reply = self.rpc_storage_server(host, port, {
-            'method': 'read',
-            'id': file_id,
-        })
-        if read_reply['result'] != 'success':
-            return False, f"read failed: {read_reply['result']}"
-
-        encoded = read_reply['return']['contents']
-        raw = base64.b64decode(encoded.encode('utf-8'))
-
-        temp_path = None
-        suffix = ''
-        _, _, filename = path.rpartition('/')
-        if '.' in filename:
-            suffix = '.' + filename.split('.')[-1]
+        success, raw = self.read_from_any_replica(file_id, replicas)
+        if not success:
+            return False, raw
 
         try:
+            success, new_raw = self.edit_temp_file(path, raw)
+            if not success:
+                return False, new_raw
+
+            if new_raw == raw:
+                return True, f'no changes to file: {path}'
+            
+            success, msg = self.write_to_replicas(file_id, replicas, new_raw)
+            if not success:
+                return False, msg
+            
+            return True, f'edited file: {path}'
+        finally:
+            stop_event.set()
+            self.rpc({'method': 'unlock', 'user': self.username, 'path': path})
+
+    def create_and_open(self, path):
+        success, open_result = self.open_for_write(path)
+        if success:
+            return True, open_result
+
+        if open_result != 'file not found':
+            return False, open_result
+
+        # create file if it doesn't exist
+        parent, _, filename = path.rpartition('/')
+        success, create_result = self.create(parent, filename)
+        if not success:
+            return False, f'create failed: {create_result}'
+
+        return self.open_for_write(path)
+
+    def read_from_any_replica(self, file_id, replicas):
+        random.shuffle(replicas)
+        
+        last_error = None
+        for replica in replicas:
+            try:
+                reply = self.rpc_storage_server(replica['host'], replica['port'], {
+                    'method': 'read',
+                    'id': file_id,
+                })
+                if reply['result'] == 'success' and reply['return'] is not None:
+                    encoded = reply['return']['contents']
+                    raw = base64.b64decode(encoded.encode('utf-8'))
+                    return True, raw
+                last_error = reply['result']
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        return False, f'failed to read from storage server: {last_error}'
+    
+    def edit_temp_file(self, path, raw):
+        temp_path = None
+        try:
+            _, _, filename = path.rpartition('/')
+            suffix = ''
+            if '.' in filename:
+                suffix = '.' + filename.split('.')[-1]
+
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 temp_path = tmp.name
                 tmp.write(raw)
@@ -290,20 +384,45 @@ class Client:
             subprocess.run(['vim', temp_path], check=False)
 
             with open(temp_path, 'rb') as f:
-                new_raw = f.read()
-
-            write_reply = self.rpc_storage_server(host, port, {
-                'method': 'write',
-                'id': file_id,
-                'contents': base64.b64encode(new_raw).decode('utf-8'),
-            })
-            if write_reply['result'] != 'success':
-                return False, f"write failed: {write_reply['result']}"
-
-            return True, f'edited file: {path}'
+                return True, f.read()
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
+    
+    def write_to_replicas(self, file_id, replicas, raw):
+        encoded = base64.b64encode(raw).decode('utf-8')
+        successes = 0
+        last_error = None
+
+        for replica in replicas:
+            try:
+                reply = self.rpc_storage_server(replica['host'], replica['port'], {
+                    'method': 'write',
+                    'id': file_id,
+                    'contents': encoded,
+                })
+                if reply['result'] == 'success':
+                    successes += 1
+                else:
+                    last_error = reply['result']
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        if successes == 0:
+            return False, f'failed to write to any storage server: {last_error}'
+
+        return True, f'wrote to {successes} replica(s)'
+    
+    def renew_lock(self, path, stop_event):
+        message = {
+            'method': 'lock',
+            'user': self.username,
+            'path': path
+        }
+        # periodically renew lock so lease doesn't expire
+        while not stop_event.wait(LOCK_LEASE / 2):
+            self.rpc(message)
 
     def connect(self, hostname, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
