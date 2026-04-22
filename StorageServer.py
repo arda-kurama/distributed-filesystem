@@ -50,7 +50,7 @@ class StorageServer:
             # first time starting this storage server
             self.id = None
         self.register() # let name server know we are back/newly joining
-        print(f'Registered as: {self.server_name}')
+        print(f'Registered as storage server {self.id}')
 
         self.playback()
         self.save_identity({'id': self.id, 'host': self.hostname, 'port': self.port})        

@@ -164,10 +164,10 @@ class Client:
 
     # main loop of client    
     def run_shell(self):
-        os.system('clear')
-        os.system('clear')
+        # os.system('clear')
+        # os.system('clear')
         while 1:
-            print(f'{self.username}:{self.path} %', end=' ', flush=True)
+            print(f'{self.username}@{self.project_name}:{self.path} %', end=' ', flush=True)
             input = sys.stdin.readline().strip()
 
             args = input.split(' ')

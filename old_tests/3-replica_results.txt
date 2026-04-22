@@ -1,0 +1,47 @@
+Clients: 5
+Requests/client: 100
+Total requests: 500
+Successful: 500
+Failed: 0
+Total test time: 5.592 s
+Throughput: 89.42 req/s
+Average latency: 55.90 ms
+P50 latency: 55.41 ms
+P95 latency: 56.47 ms
+P99 latency: 103.05 ms
+
+Clients: 10
+Requests/client: 100
+Total requests: 1000
+Successful: 1000
+Failed: 0
+Total test time: 8.490 s
+Throughput: 117.78 req/s
+Average latency: 78.46 ms
+P50 latency: 65.76 ms
+P95 latency: 114.52 ms
+P99 latency: 267.69 ms
+
+Clients: 25
+Requests/client: 100
+Total requests: 2500
+Successful: 2500
+Failed: 0
+Total test time: 11.978 s
+Throughput: 208.71 req/s
+Average latency: 106.79 ms
+P50 latency: 88.57 ms
+P95 latency: 129.25 ms
+P99 latency: 1098.75 ms
+
+Clients: 50
+Requests/client: 100
+Total requests: 5000
+Successful: 5000
+Failed: 0
+Total test time: 21.416 s
+Throughput: 233.47 req/s
+Average latency: 205.94 ms
+P50 latency: 205.34 ms
+P95 latency: 269.93 ms
+P99 latency: 318.93 ms

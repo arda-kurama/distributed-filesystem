@@ -77,7 +77,6 @@ class NameServer():
         # initialize files and directories using checkpoint and log files
         self.playback()
         self.next_storage_server_id = max(info.id for info in self.storage_servers.values()) + 1 if self.storage_servers else 1
-        print(f'next_id: {self.next_storage_server_id}')
 
         # create socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -384,6 +383,10 @@ class NameServer():
         if 'method' not in rpc:
             return self.make_reply('invalid message, no method provided')
         
+        method = rpc.get('method')
+        if method in ['ls', 'create', 'remove', 'mkdir', 'cd', 'tree']:
+            print(f'handling {rpc['method']}')
+        
         # client methods
         if rpc['method'] == 'ls':
             return self.ls(rpc.get('path'))
@@ -413,7 +416,11 @@ class NameServer():
             return self.register_storage_server(rpc.get('id'), rpc.get('host'), rpc.get('port'))
         if rpc['method'] == 'heartbeat':
             info = self.storage_servers[rpc.get('id')]
+            # print(f'Hearbeat from storage server {info.id}')
             info.last_heartbeat = time.time()
+            if info.alive is False:
+                # print(f'Storage server {info.id} back alive')
+                pass
             info.alive = True
             return self.make_reply('success')
 
@@ -516,10 +523,13 @@ class NameServer():
         if filename in self.dir_tree[client_path]['dirs']:
             return self.make_reply('cannot change permissions of directory')
         
+        path = self.child_path(client_path, filename)
+
+        if path not in self.paths:
+            return self.make_reply('file does not exist')
+        
         if permissions not in {'owner', 'all'}:
             return self.make_reply('invalid permissions')
-        
-        path = self.child_path(client_path, filename)
 
         meta = self.paths[path]
         if meta.owner != user:
@@ -817,12 +827,12 @@ class NameServer():
                 alive=True,
                 files=[]
             )
-
-            print(f'registered storage server {server_id} at {host}:{port}')
         else:
             info = self.storage_servers[server_id]
             info.last_heartbeat = time.time()
             info.alive = True
+        
+        print(f'registered storage server {server_id} at {host}:{port}')
 
         return self.make_reply('success', server_id)
 
@@ -896,8 +906,9 @@ class NameServer():
     def reap_storage_servers(self):
         now = time.time()
         for info in self.storage_servers.values():
-            if now - info.last_heartbeat > HEARTBEAT_TIMEOUT:
+            if info.alive and now - info.last_heartbeat > HEARTBEAT_TIMEOUT:
                 info.alive = False
+                print(f'Storage server {info.id} died')
 
     def run(self):
         threading.Thread(target=self.update_register, daemon=True).start()
