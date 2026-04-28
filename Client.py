@@ -79,7 +79,7 @@ class Client:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((hostname, port))
 
-        if self.verbose:
+        if self.very_verbose:
             print(f'Connected to {hostname} on port {port}')
     
     def lookup_server_name(self):
@@ -164,10 +164,11 @@ class Client:
 
     # main loop of client    
     def run_shell(self):
-        # os.system('clear')
-        # os.system('clear')
+        os.system('clear')
+        os.system('clear')
         while 1:
-            print(f'{self.username}@{self.project_name}:{self.path} %', end=' ', flush=True)
+            # highlight in different colors
+            print(f'\033[1;32m{self.username}@{self.project_name}:\033[1;34m{self.path}\033[0m %', end=' ', flush=True)
             input = sys.stdin.readline().strip()
 
             args = input.split(' ')
@@ -353,7 +354,7 @@ class Client:
 
             output = ''
             for dir in dirs:
-                output += f'\033[1;32;40m{dir}\033[0m ' # directories highlighted in green
+                output += f'\033[1;32m{dir}\033[0m ' # directories highlighted in green
             for file in files:
                 output += file + ' '
         
@@ -525,7 +526,7 @@ class Client:
             if new_raw == raw:
                 return True, f'no changes to file: {path}', False
             
-            success, msg, _ = self.write_to_replicas(file_id, replicas, new_raw)
+            success, msg, _ = self.write_back(path, new_raw)
             if not success:
                 return False, msg, True
             
@@ -597,30 +598,20 @@ class Client:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
     
-    def write_to_replicas(self, file_id, replicas, raw):
+    def write_back(self, path, raw):
         encoded = base64.b64encode(raw).decode('utf-8')
-        successes = 0
-        last_error = None
 
-        for replica in replicas:
-            try:
-                reply = self.rpc_storage_server(replica['host'], replica['port'], {
-                    'method': 'write',
-                    'id': file_id,
-                    'contents': encoded,
-                })
-                if reply['result'] == 'success':
-                    successes += 1
-                else:
-                    last_error = reply['result']
-            except Exception as e:
-                last_error = str(e)
-                continue
+        reply = self.rpc({
+            'method': 'write',
+            'user': self.username,
+            'path': path,
+            'contents': encoded,
+        })
 
-        if successes != len(replicas):
-            return False, f'failed to write to storage server: {last_error}', True
+        if reply['result'] != 'success':
+            return False, reply['result'], True
 
-        return True, f'wrote to {successes} replica(s)', False
+        return True, reply['return'], False
     
     # keeps lock alive while editing in vim
     def renew_lock(self, path, stop_event):
@@ -701,7 +692,8 @@ def main():
     username = sys.argv[2]
 
     c = Client(username, project_name, False)
-    # c.very_verbose = False
+    # c.verbose = True
+    # c.very_verbose = True
     c.run_shell()
 
 if __name__ == '__main__':

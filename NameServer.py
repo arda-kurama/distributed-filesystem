@@ -26,11 +26,12 @@ HEADER_LEN = 4
 
 # metadata for files stored in NameServer paths
 class FileData:
-    def __init__(self, id, path, owner, servers, permissions, lock_owner=None, lock_expire=0):
+    def __init__(self, id, path, owner, servers, version=0, permissions='all', lock_owner=None, lock_expire=0):
         self.id = id
         self.path = path
         self.owner = owner # username of who created file
         self.servers = servers # list of storage server id's
+        self.version = version
         self.permissions = permissions # who is allowed to edit ('owner', 'all')
         self.lock_owner = lock_owner # who is currently editing
         self.lock_expire = lock_expire
@@ -49,6 +50,8 @@ class NameServer():
     def __init__(self, project_name):
         self.project_name = project_name
         self.server_name = f'{self.project_name}-NS'
+        self.verbose = False
+
         self.paths = dict() # path -> FileData()
         self.dir_tree = defaultdict(lambda: {
             'dirs': set(),
@@ -132,6 +135,7 @@ class NameServer():
                         path=meta['path'],
                         owner=meta['owner'],
                         servers=meta['servers'],
+                        version=meta['version'],
                         permissions=meta['permissions']
                     )
                 ckpt_dir_tree = ckpt['dir_tree']
@@ -185,6 +189,9 @@ class NameServer():
                         else:
                             self.dir_tree.pop(operation['path'])
                             self.dir_tree[parent_dir]['dirs'].remove(name)
+                    if operation['operation'] == 'write':
+                        if operation['path'] in self.paths:
+                            self.paths[operation['path']].version = operation['version']
                     if operation['operation'] == 'register':
                         self.storage_servers[operation['id']] = StorageServerInfo(
                             id=operation['id'],
@@ -213,6 +220,7 @@ class NameServer():
                 'path': meta.path,
                 'owner': meta.owner,
                 'servers': meta.servers,
+                'version': meta.version,
                 'permissions': meta.permissions
             }
         
@@ -383,9 +391,8 @@ class NameServer():
         if 'method' not in rpc:
             return self.make_reply('invalid message, no method provided')
         
-        method = rpc.get('method')
-        if method in ['ls', 'create', 'remove', 'mkdir', 'cd', 'tree']:
-            print(f'handling {rpc['method']}')
+        if self.verbose:
+            print(f'handling {rpc.get('method')}')
         
         # client methods
         if rpc['method'] == 'ls':
@@ -406,6 +413,8 @@ class NameServer():
             return self.open_for_read(rpc.get('path'))
         if rpc['method'] == 'open_for_write':
             return self.open_for_write(rpc.get('user'), rpc.get('path'))
+        if rpc['method'] == 'write':
+            return self.write(rpc.get('user'), rpc.get('path'), rpc.get('contents'))
         if rpc['method'] == 'lock':
             return self.lock(rpc.get('user'), rpc.get('path'))
         if rpc['method'] == 'unlock':
@@ -416,11 +425,11 @@ class NameServer():
             return self.register_storage_server(rpc.get('id'), rpc.get('host'), rpc.get('port'))
         if rpc['method'] == 'heartbeat':
             info = self.storage_servers[rpc.get('id')]
-            # print(f'Hearbeat from storage server {info.id}')
             info.last_heartbeat = time.time()
-            if info.alive is False:
-                # print(f'Storage server {info.id} back alive')
-                pass
+            if self.verbose:
+                print(f'Hearbeat from storage server {info.id}')
+                if info.alive is False:
+                    print(f'Storage server {info.id} back alive')
             info.alive = True
             return self.make_reply('success')
 
@@ -511,7 +520,12 @@ class NameServer():
         self.log_entries += 1
         
         # 2. add metadata to hash table in memory
-        self.paths[path] = FileData(file_id, path, user, created_on, 'owner')
+        self.paths[path] = FileData(
+            id=file_id,
+            path=path,
+            owner=user,
+            servers=created_on
+        )
         self.dir_tree[client_path]['files'].add(filename)
 
         return self.make_reply('success')
@@ -736,6 +750,95 @@ class NameServer():
             'replicas': replicas
         })
 
+    def write(self, user, path, contents):
+        if user is None or path is None or contents is None:
+            return self.make_reply('invalid arguments for write')
+
+        if path not in self.paths:
+            return self.make_reply('file not found')
+
+        meta = self.paths[path]
+
+        if meta.permissions == 'owner' and meta.owner != user:
+            return self.make_reply('permission denied')
+
+        now = time.time()
+        if meta.lock_owner != user or meta.lock_expire < now:
+            return self.make_reply('user does not hold lock')
+
+        txn_id = uuid.uuid4().hex
+        new_version = meta.version + 1
+
+        # phase 1: prepare all live replicas (storage servers all have to be alive)
+        prepared = []
+        for server_id in meta.servers:
+            info = self.storage_servers.get(server_id)
+
+            if info is None or not info.alive:
+                return self.make_reply(f'replica {server_id} is not alive; write aborted')
+
+            try:
+                reply = self.rpc_storage_server(server_id, {
+                    'method': 'prepare_write',
+                    'id': meta.id,
+                    'txn_id': txn_id,
+                    'new_version': new_version,
+                    'contents': contents,
+                })
+
+                if reply['result'] != 'success':
+                    raise RuntimeError(reply['result'])
+
+                prepared.append(server_id)
+
+            except Exception as e:
+                # abort everyone who already prepared
+                for sid in prepared:
+                    try:
+                        self.rpc_storage_server(sid, {
+                            'method': 'abort_write',
+                            'txn_id': txn_id,
+                        })
+                    except:
+                        pass
+
+                return self.make_reply(f'write aborted during prepare: {e}')
+
+        # phase 2: commit all replicas
+        committed = []
+        for server_id in prepared:
+            try:
+                reply = self.rpc_storage_server(server_id, {
+                    'method': 'commit_write',
+                    'txn_id': txn_id,
+                })
+
+                if reply['result'] != 'success':
+                    raise RuntimeError(reply['result'])
+
+                committed.append(server_id)
+
+            except Exception as e:
+                return self.make_reply(
+                    f'commit failed after some replicas committed; run repair: {e}'
+                )
+
+        operation = {
+            'operation': 'write',
+            'path': path,
+            'version': new_version,
+        }
+
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+
+        self.log_entries += 1
+        meta.version = new_version
+
+        return self.make_reply('success', f'wrote version {new_version} to {len(committed)} replicas')
+
     def lock(self, user, path):
         if user is None or path is None:
             return self.make_reply('invalid arguments for open')
@@ -908,7 +1011,8 @@ class NameServer():
         for info in self.storage_servers.values():
             if info.alive and now - info.last_heartbeat > HEARTBEAT_TIMEOUT:
                 info.alive = False
-                print(f'Storage server {info.id} died')
+                if self.verbose:
+                    print(f'Storage server {info.id} died')
 
     def run(self):
         threading.Thread(target=self.update_register, daemon=True).start()
@@ -934,8 +1038,7 @@ def main():
         raise RuntimeError('Usage: python NameServer.py [project_name]')
 
     server = NameServer(sys.argv[1])
-    server.verbose = True
-
+    # server.verbose = True
     server.run()
 
 if __name__ == '__main__':

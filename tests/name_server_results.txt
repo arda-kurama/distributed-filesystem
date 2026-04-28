@@ -1,0 +1,53 @@
+Clients: 5
+Test duration: 63.26s
+Successful: 96
+Failed: 0
+Observed throughput: 1.52 req/s
+Average latency: 51.28 ms
+P95 latency: 66.91 ms
+P99 latency: 67.76 ms
+
+Clients: 10
+Test duration: 63.32s
+Successful: 204
+Failed: 0
+Observed throughput: 3.22 req/s
+Average latency: 57.33 ms
+P95 latency: 66.72 ms
+P99 latency: 81.77 ms
+
+Clients: 25
+Test duration: 123.93s
+Successful: 998
+Failed: 0
+Observed throughput: 8.05 req/s
+Average latency: 62.59 ms
+P95 latency: 55.52 ms
+P99 latency: 269.93 ms
+
+Clients: 50
+Test duration: 64.49s
+Successful: 1012
+Failed: 0
+Observed throughput: 15.69 req/s
+Average latency: 75.80 ms
+P95 latency: 92.68 ms
+P99 latency: 1124.48 ms
+
+Clients: 100
+Test duration: 64.89s
+Successful: 1971
+Failed: 0
+Observed throughput: 30.37 req/s
+Average latency: 92.28 ms
+P95 latency: 108.81 ms
+P99 latency: 1528.07 ms
+
+Clients: 200
+Test duration: 64.84s
+Successful: 3993
+Failed: 0
+Observed throughput: 61.58 req/s
+Average latency: 92.66 ms
+P95 latency: 99.11 ms
+P99 latency: 1346.47 ms

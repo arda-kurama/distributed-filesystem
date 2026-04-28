@@ -4,8 +4,8 @@ import random
 from Client import Client
 
 PROJECT = 'filesys'
-NUM_CLIENTS = 200
-TEST_DURATION = 60   # seconds
+NUM_CLIENTS = 25
+TEST_DURATION = 120 # seconds
 
 success_count = 0
 failure_count = 0
@@ -27,7 +27,7 @@ def worker(stop_time):
     while time.time() < stop_time:
         start = time.perf_counter()
         try:
-            ok, _ = c.ls('/')
+            ok, _, _ = c.ls('/')
             elapsed = time.perf_counter() - start
 
             with lock:

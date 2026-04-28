@@ -5,7 +5,7 @@ from Client import Client
 def test_path_simple(cwd, input_path, expected_output):
     c = Client('qhynes', 'filesys', False)
     c.handle_command('cwd', [0, cwd])
-    _, output = c.handle_command('resolve', [0, input_path])
+    _, output, _ = c.handle_command('resolve', [0, input_path])
     return output
 
 def main():

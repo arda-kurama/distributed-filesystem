@@ -9,6 +9,7 @@ import threading
 import select
 import base64
 import hashlib
+import uuid
 
 # shared with name server
 HEADER_LEN = 4
@@ -29,15 +30,16 @@ class StorageServer:
         self.verbose = verbose
         self.very_verbose = False
         self.files = dict() # id -> StoredFile()
+        self.prepared = dict()  # txn_id -> prepared write info
 
         # create socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.hostname = socket.gethostname()
-        self.port = port
-        self.server_socket.bind((self.hostname, self.port))
+        self.server_socket.bind((self.hostname, port))
         self.server_socket.listen()
         self.server_socket.setblocking(False)
+        _, self.port = self.server_socket.getsockname()
         print(f'Listening on {self.hostname}:{self.port}')
 
         # load identity and register with name server
@@ -45,7 +47,7 @@ class StorageServer:
         self.identity_file = f'{self.server_name}/identity.json'
         identity = self.load_identity()
         if identity:
-            self.id = identity['id']
+            self.id = int(identity['id'])
         else:
             # first time starting this storage server
             self.id = None
@@ -101,11 +103,14 @@ class StorageServer:
         # periodically let name server know we're still here
         while True:
             time.sleep(HEARTBEAT_TIMEOUT / 2)
+            if self.verbose:
+                print('Sending hearbeat to NameServer...')
             self.rpc(message)
 
     # checkpoint and log methods
     def playback(self):
         self.data_dir = f'{self.server_name}/data'
+        self.tmp_dir = f'{self.server_name}/tmp'
         self.checkpoint = f'{self.server_name}/table.ckpt'
         self.log = f'{self.server_name}/table.txn'
         self.log_entries = 0
@@ -116,7 +121,8 @@ class StorageServer:
 
             if not os.path.exists(self.log) or \
             not os.path.exists(self.checkpoint) or \
-            not os.path.exists(self.data_dir):
+            not os.path.exists(self.data_dir) or \
+            not os.path.exists(self.tmp_dir):
                 # create relevant files if they dont exist
                 if not os.path.exists(self.checkpoint):
                     with open(self.checkpoint, 'a') as _:
@@ -126,6 +132,8 @@ class StorageServer:
                         pass
                 if not os.path.exists(self.data_dir):
                     os.mkdir(self.data_dir)
+                if not os.path.exists(self.tmp_dir):
+                    os.mkdir(self.tmp_dir)
             return
         
         # load checkpoint into memory
@@ -171,9 +179,12 @@ class StorageServer:
                             meta.size = operation['size']
                             meta.checksum = operation['checksum']
                             meta.modified = operation['modified']
-                    if operation['method'] == 'delete':
-                        # delete, file, position, length
-                        pass
+                    if operation['method'] == 'prepared':
+                        self.prepared[operation['txn']] = operation
+                    if operation['method'] == 'committed':
+                        self.prepared.pop(operation['txn'], None)
+                    if operation['method'] == 'aborted':
+                        self.prepared.pop(operation['txn'], None)
         except json.JSONDecodeError:
             # empty log file
             pass
@@ -451,6 +462,14 @@ class StorageServer:
             return self.stat(rpc.get('id'))
         if rpc['method'] == 'read':
             return self.read(rpc.get('id'))
+        
+        if rpc['method'] == 'prepare_write':
+            return self.prepare_write(rpc.get('id'), rpc.get('txn_id'), rpc.get('new_version'), rpc.get('contents'))
+        if rpc['method'] == 'commit_write':
+            return self.commit_write(rpc.get('txn_id'))
+        if rpc['method'] == 'abort_write':
+            return self.abort_write(rpc.get('txn_id'))
+        
         if rpc['method'] == 'write':
             return self.write(rpc.get('id'), rpc.get('contents'))
         
@@ -537,6 +556,119 @@ class StorageServer:
             'modified': meta.modified,
         })
 
+    def prepare_write(self, file_id, txn_id, new_version, contents):
+        if file_id is None or file_id not in self.files or txn_id is None or contents is None:
+            return self.make_reply('invalid arguments for prepare_write')
+
+        try:
+            raw = base64.b64decode(contents.encode('utf-8'))
+        except Exception:
+            return self.make_reply('invalid contents')
+
+        # write updates to temporary file
+        tmp_file = uuid.uuid4().hex
+        tmp_path = f'{self.tmp_dir}/{tmp_file}'
+
+        with open(tmp_path, 'wb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+
+        checksum = hashlib.sha256(raw).hexdigest()
+
+        operation = {
+            'method': 'prepared',
+            'id': file_id,
+            'txn': txn_id,
+            'tmp_file': tmp_file,
+            'new_version': new_version,
+            'size': len(raw),
+            'checksum': checksum,
+            'modified': time.time(),
+        }
+
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(operation) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+
+        self.log_entries += 1
+        self.prepared[txn_id] = operation
+
+        return self.make_reply('success')
+
+    def commit_write(self, txn_id):
+        if txn_id is None:
+            return self.make_reply('invalid arguments for commit_write')
+
+        if txn_id not in self.prepared:
+            return self.make_reply('unknown transaction')
+
+        operation = self.prepared[txn_id]
+        file_id = operation['id']
+
+        if file_id not in self.files:
+            return self.make_reply('file not found')
+
+        tmp_path = f'{self.tmp_dir}/{operation['tmp_file']}'
+        final_path = self.files[file_id].stored_path
+
+        if not os.path.exists(tmp_path):
+            return self.make_reply('prepared temp file missing')
+
+        os.replace(tmp_path, final_path)
+
+        log_entry = {
+            'method': 'committed',
+            'txn': txn_id,
+            'id': file_id,
+            'size': operation['size'],
+            'checksum': operation['checksum'],
+            'modified': operation['modified'],
+        }
+
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+
+        self.log_entries += 1
+
+        meta = self.files[file_id]
+        meta.size = operation['size']
+        meta.checksum = operation['checksum']
+        meta.modified = operation['modified']
+
+        self.prepared.pop(txn_id, None)
+
+        return self.make_reply('success')
+
+    def abort_write(self, txn_id):
+        if txn_id is None:
+            return self.make_reply('invalid arguments for abort_write')
+
+        operation = self.prepared.get(txn_id)
+
+        if operation is not None:
+            tmp_path = f'{self.tmp_dir}/{operation["tmp_file"]}'
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        log_entry = {
+            'method': 'aborted',
+            'txn': txn_id,
+        }
+
+        with open(self.log, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+
+        self.log_entries += 1
+        self.prepared.pop(txn_id, None)
+
+        return self.make_reply('success')
+
     def write(self, file_id, contents):
         if file_id is None or file_id not in self.files or contents is None:
             return self.make_reply('invalid arguments for write')
@@ -604,6 +736,8 @@ def main():
     port = int(sys.argv[2])
 
     s = StorageServer(project_name, port, False)
+    # s.verbose = True
+    # s.very_verbose = True
     s.run()
 
 if __name__ == '__main__':

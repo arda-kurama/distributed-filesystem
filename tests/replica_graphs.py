@@ -27,16 +27,17 @@ def graph_results():
     clients1, latencies1 = load_results('1-replica_results.txt')
     clients3, latencies3 = load_results('3-replica_results.txt')
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+    plt.figure(figsize=(6, 4))
 
-    axs[0].plot(clients1, latencies1, marker='o')
-    axs[0].set_title("Latency vs Clients")
-    axs[0].set_xlabel("Clients")
-    axs[0].set_ylabel("Latency (ms)")
-    axs[0].set_xticks(clients1)
-    axs[0].grid(True)
+    plt.plot(clients1, latencies1, marker='o', label='1 Replica')
+    plt.plot(clients3, latencies3, marker='o', label='3 Replicas')
 
-    axs[0].plot(clients3, latencies3, marker='o')
+    plt.title('Latency vs Clients')
+    plt.xlabel('Clients')
+    plt.ylabel('Latency (ms)')
+    plt.xticks(sorted(set(clients1 + clients3)))
+    plt.grid(True)
+    plt.legend()
 
     plt.tight_layout()
     plt.show()
